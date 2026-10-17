@@ -9,6 +9,8 @@ from api.enums import WorkflowRunMode
 from api.errors.failure import mark_failure_reported
 from api.schemas.answer_supervisor import resolve_answer_supervisor_config
 from api.schemas.workflow_configurations import (
+    DEFAULT_EMPTY_TURN_RECOVERY,
+    DEFAULT_GREETING_MIN_WORDS,
     DEFAULT_MAX_CALL_DURATION_SECONDS,
     DEFAULT_MAX_USER_IDLE_TIMEOUT_SECONDS,
     DEFAULT_SMART_TURN_STOP_SECS,
@@ -40,6 +42,10 @@ from api.services.pipecat.event_handlers import (
     register_event_handlers,
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
+from api.services.pipecat.phrase_turn_start import (
+    create_turn_start_strategy,
+    resolve_turn_start_phrases,
+)
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -99,15 +105,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
 from pipecat.turns.user_mute import (
     CallbackUserMuteStrategy,
     FunctionCallUserMuteStrategy,
     MuteUntilFirstBotCompleteUserMuteStrategy,
 )
-from pipecat.turns.user_start import (
-    ExternalUserTurnStartStrategy,
-    MinWordsUserTurnStartStrategy,
-)
+from pipecat.turns.user_start import ExternalUserTurnStartStrategy
 from pipecat.turns.user_start.transcription_user_turn_start_strategy import (
     TranscriptionUserTurnStartStrategy,
 )
@@ -197,6 +201,35 @@ def _resolve_turn_start_min_words(run_configs: dict) -> int:
     )
 
 
+def _resolve_greeting_min_words(run_configs: dict) -> int:
+    min_words = run_configs.get("greeting_min_words")
+    return max(
+        1,
+        int(DEFAULT_GREETING_MIN_WORDS if min_words is None else min_words),
+    )
+
+
+# What a caller hears after cutting the bot off with a sound the STT could
+# not read. Pipecat's default makes the bot repeat its question, which on a
+# phone line turns a "mm-hm" the recogniser missed into the greeting starting
+# over. "resume" tells the model to carry on instead; "silent" answers nothing.
+RESUME_EMPTY_TURN_PROMPT = (
+    "You were cut off by a sound that was not words. Do not start over and do "
+    "not repeat yourself: continue from the point you stopped, and if your "
+    "question was already out, say nothing and wait."
+)
+
+
+def _resolve_empty_user_turn(run_configs: dict) -> EmptyUserTurnConfig | None:
+    """The user aggregator's empty-turn policy for ``empty_turn_recovery``."""
+    recovery = run_configs.get("empty_turn_recovery", DEFAULT_EMPTY_TURN_RECOVERY)
+    if recovery == "silent":
+        return None
+    if recovery == "resume":
+        return EmptyUserTurnConfig(interrupted_prompt=RESUME_EMPTY_TURN_PROMPT)
+    return EmptyUserTurnConfig()
+
+
 def _create_non_realtime_user_turn_start_strategies(
     run_configs: dict, *, uses_external_turns: bool
 ):
@@ -209,9 +242,12 @@ def _create_non_realtime_user_turn_start_strategies(
         turn_start_strategy = DEFAULT_TURN_START_STRATEGY
 
     if turn_start_strategy == "min_words":
+        ignore_phrases, break_in_phrases = resolve_turn_start_phrases(run_configs)
         return [
-            MinWordsUserTurnStartStrategy(
-                min_words=_resolve_turn_start_min_words(run_configs)
+            create_turn_start_strategy(
+                min_words=_resolve_turn_start_min_words(run_configs),
+                ignore_phrases=ignore_phrases,
+                break_in_phrases=break_in_phrases,
             )
         ]
 
@@ -1004,6 +1040,7 @@ async def _run_pipeline_impl(
         # The call monitor owns idle reminders and response deadlines together.
         user_idle_timeout=0,
         vad_analyzer=user_vad_analyzer,
+        empty_user_turn=_resolve_empty_user_turn(run_configs),
     )
     if is_realtime:
         context_aggregator = LLMContextAggregatorPair(
@@ -1025,6 +1062,12 @@ async def _run_pipeline_impl(
                 assistant_params=assistant_params,
                 realtime_service_mode=False,
             )
+        )
+        ignore_phrases, break_in_phrases = resolve_turn_start_phrases(run_configs)
+        engine.greeting.configure(
+            min_words=_resolve_greeting_min_words(run_configs),
+            ignore_phrases=ignore_phrases,
+            break_in_phrases=break_in_phrases,
         )
         engine.greeting.bind(user_context_aggregator)
 

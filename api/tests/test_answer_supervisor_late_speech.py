@@ -103,6 +103,7 @@ async def late_call(
     turn_stop_timeout=5,
     recording_fetch=None,
     wait_for_output=True,
+    greeting=None,
     **config,
 ):
     node = workflow.nodes[workflow.start_node_id]
@@ -191,6 +192,8 @@ async def late_call(
         ),
     )
     normal_strategies = user.user_turn_controller.user_turn_strategies
+    if greeting:
+        engine.greeting.configure(**greeting)
     engine.greeting.bind(user)
     if supervised:
         supervisor.bind(user)
@@ -1521,3 +1524,79 @@ async def test_interrupted_greeting_text_is_logged_but_excluded_from_inference(
         assert [
             e["payload"]["text"] for e in events if e["type"] == "rtf-bot-text"
         ].count("Welcome.") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("greeting_type", ["text", "audio"])
+@pytest.mark.parametrize("external_turns", [False, True])
+async def test_one_word_greeting_threshold_lets_hello_interrupt(
+    simple_workflow, greeting_type, external_turns
+):
+    async with late_call(
+        simple_workflow,
+        greeting_type,
+        external_turns=external_turns,
+        greeting={"min_words": 1},
+    ) as c:
+        await c.say("Hello.")
+        await asyncio.wait_for(c.action, 3)
+        await until(lambda: c.llm.get_current_step() == 1)
+        assert await c.engine.drain_call_pipeline()
+        assert c.speech.outcome is PlaybackOutcome.INTERRUPTED
+        assert c.output.interruptions == 1
+        assert [
+            m["content"] for m in c.generation_messages[-1] if m.get("role") == "user"
+        ][-1] == "Hello."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("greeting_type", ["text", "audio"])
+@pytest.mark.parametrize("external_turns", [False, True])
+async def test_ignored_back_channel_never_interrupts_the_greeting(
+    simple_workflow, greeting_type, external_turns
+):
+    async with late_call(
+        simple_workflow,
+        greeting_type,
+        external_turns=external_turns,
+        greeting={"min_words": 1, "ignore_phrases": ["uh-huh", "yeah"]},
+    ) as c:
+        for word in ("Uh-huh.", "Yeah, yeah."):
+            await c.say(word)
+            assert not any(m.get("content") == word for m in c.context.messages)
+            await until(lambda: not c.user._user_turn_controller.has_active_user_turn)
+        assert not c.speech.done
+        assert c.output.interruptions == 0
+        assert c.llm.get_current_step() == 0
+        c.output.resume.set()
+        await asyncio.wait_for(c.action, 3)
+        assert await c.engine.drain_call_pipeline()
+        assert c.speech.outcome is PlaybackOutcome.PLAYED
+        assert c.context.messages == [{"role": "assistant", "content": "Welcome."}]
+        assert c.user.user_turn_controller.user_turn_strategies is c.normal_strategies
+        # Once the greeting has played, the same word is a turn like any other.
+        await c.say("Yeah.")
+        await until(lambda: c.llm.get_current_step() == 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("greeting_type", ["text", "audio"])
+@pytest.mark.parametrize("external_turns", [False, True])
+async def test_break_in_phrase_interrupts_the_greeting_below_its_threshold(
+    simple_workflow, greeting_type, external_turns
+):
+    async with late_call(
+        simple_workflow,
+        greeting_type,
+        external_turns=external_turns,
+        greeting={"min_words": 3, "break_in_phrases": ["stop"]},
+    ) as c:
+        await c.say("Stop.")
+        await asyncio.wait_for(c.action, 3)
+        await until(lambda: c.llm.get_current_step() == 1)
+        assert await c.engine.drain_call_pipeline()
+        assert c.speech.outcome is PlaybackOutcome.INTERRUPTED
+        assert c.output.interruptions == 1
+        assert [
+            m["content"] for m in c.generation_messages[-1] if m.get("role") == "user"
+        ][-1] == "Stop."

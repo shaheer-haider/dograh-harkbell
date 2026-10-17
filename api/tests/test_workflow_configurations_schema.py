@@ -8,6 +8,8 @@ from api.constants import (
 )
 from api.schemas.workflow_configurations import (
     DEFAULT_CALL_DISPOSITION_OPTIONS,
+    DEFAULT_EMPTY_TURN_RECOVERY,
+    DEFAULT_GREETING_MIN_WORDS,
     DEFAULT_MAX_CALL_DURATION_SECONDS,
     DEFAULT_TURN_START_STRATEGY,
     MAX_CALL_DISPOSITION_CODE_LENGTH,
@@ -16,6 +18,8 @@ from api.schemas.workflow_configurations import (
     MAX_CALL_DISPOSITIONS,
     MAX_CALL_DURATION_SECONDS,
     MAX_EXTERNAL_PBX_LEAD_HEADERS,
+    MAX_TURN_START_PHRASE_LENGTH,
+    MAX_TURN_START_PHRASES,
     TextChatInactivityTimeoutConstraints,
     WorkflowConfigurationDefaults,
     get_default_call_disposition_options,
@@ -369,3 +373,70 @@ def test_external_pbx_lead_headers_treat_null_as_unset():
     )
 
     assert config.external_pbx_lead_headers == []
+
+
+# --- phrase-aware interruption and empty-turn recovery -----------------------
+
+
+def test_interruption_phrase_fields_default_to_todays_behaviour():
+    config = WorkflowConfigurationDefaults()
+    assert config.turn_start_ignore_phrases == []
+    assert config.turn_start_break_in_phrases == []
+    assert config.greeting_min_words == DEFAULT_GREETING_MIN_WORDS == 2
+    assert config.empty_turn_recovery == DEFAULT_EMPTY_TURN_RECOVERY == "repeat"
+    assert config.model_dump(exclude_unset=True) == {}
+
+
+def test_phrase_lists_are_trimmed_deduplicated_and_blank_lines_dropped():
+    config = WorkflowConfigurationDefaults(
+        turn_start_ignore_phrases=[" uh-huh ", "", "yeah", "uh-huh", "   "],
+        turn_start_break_in_phrases=["stop", "Hold on "],
+    )
+    assert config.turn_start_ignore_phrases == ["uh-huh", "yeah"]
+    assert config.turn_start_break_in_phrases == ["stop", "Hold on"]
+
+
+def test_phrase_lists_refuse_too_many_or_too_long_entries():
+    with pytest.raises(ValidationError):
+        WorkflowConfigurationDefaults(
+            turn_start_ignore_phrases=[
+                f"p{i}" for i in range(MAX_TURN_START_PHRASES + 1)
+            ]
+        )
+    with pytest.raises(ValidationError):
+        WorkflowConfigurationDefaults(
+            turn_start_break_in_phrases=["x" * (MAX_TURN_START_PHRASE_LENGTH + 1)]
+        )
+
+
+def test_phrase_lists_null_means_unset():
+    config = WorkflowConfigurationDefaults(
+        turn_start_ignore_phrases=None,
+        greeting_min_words=None,
+        empty_turn_recovery=None,
+    )
+    assert config.turn_start_ignore_phrases == []
+    assert config.greeting_min_words == 2
+    assert config.empty_turn_recovery == "repeat"
+
+
+@pytest.mark.parametrize("min_words", [0, -1])
+def test_greeting_min_words_rejects_non_positive(min_words):
+    with pytest.raises(ValidationError) as exc_info:
+        WorkflowConfigurationDefaults(greeting_min_words=min_words)
+    error = exc_info.value.errors()[0]
+    assert error["loc"] == ("greeting_min_words",)
+    assert error["type"] == "greater_than_equal"
+
+
+@pytest.mark.parametrize("recovery", ["repeat", "resume", "silent"])
+def test_empty_turn_recovery_accepts_its_three_values(recovery):
+    assert (
+        WorkflowConfigurationDefaults(empty_turn_recovery=recovery).empty_turn_recovery
+        == recovery
+    )
+
+
+def test_empty_turn_recovery_rejects_anything_else():
+    with pytest.raises(ValidationError):
+        WorkflowConfigurationDefaults(empty_turn_recovery="ask")

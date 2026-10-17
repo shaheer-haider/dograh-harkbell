@@ -30,10 +30,15 @@ import logger from "@/lib/logger";
 import {
     type AmbientNoiseConfiguration,
     type CallDispositionOption,
+    DEFAULT_GREETING_MIN_WORDS,
     DEFAULT_TURN_START_MIN_WORDS,
     DEFAULT_VOICEMAIL_DETECTION_CONFIGURATION,
+    EMPTY_TURN_RECOVERY_OPTIONS,
+    type EmptyTurnRecovery,
     type ExternalPBXFieldMapping,
     resolveWorkflowConfigurations,
+    SUGGESTED_TURN_START_BREAK_IN_PHRASES,
+    SUGGESTED_TURN_START_IGNORE_PHRASES,
     TURN_START_STRATEGY_OPTIONS,
     type TurnStartStrategy,
     type TurnStopStrategy,
@@ -51,6 +56,18 @@ import {
     normalizeCallDispositions,
     validateCallDispositionRows,
 } from "./components/CallDispositionEditor";
+
+// A textarea holds one phrase per line; blank lines and repeats are dropped
+// before the list is compared or saved, so trailing newlines never read as a
+// change and never reach the backend.
+function splitPhraseLines(text: string): string[] {
+    const phrases: string[] = [];
+    for (const line of text.split("\n")) {
+        const phrase = line.trim();
+        if (phrase && !phrases.includes(phrase)) phrases.push(phrase);
+    }
+    return phrases;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -260,6 +277,19 @@ function GeneralSection({
     const [turnStartMinWords, setTurnStartMinWords] = useState(
         workflowConfigurations.turn_start_min_words,
     );
+    // One phrase per line in the textarea; the list is what is saved.
+    const [turnStartIgnorePhrases, setTurnStartIgnorePhrases] = useState(
+        workflowConfigurations.turn_start_ignore_phrases.join("\n"),
+    );
+    const [turnStartBreakInPhrases, setTurnStartBreakInPhrases] = useState(
+        workflowConfigurations.turn_start_break_in_phrases.join("\n"),
+    );
+    const [greetingMinWords, setGreetingMinWords] = useState(
+        workflowConfigurations.greeting_min_words,
+    );
+    const [emptyTurnRecovery, setEmptyTurnRecovery] = useState<EmptyTurnRecovery>(
+        workflowConfigurations.empty_turn_recovery,
+    );
     const [turnStopStrategy, setTurnStopStrategy] = useState<TurnStopStrategy>(
         workflowConfigurations.turn_stop_strategy,
     );
@@ -288,6 +318,17 @@ function GeneralSection({
     const { playingId, toggle: togglePlayback } = useAudioPlayback();
     const selectedTurnStartStrategy = TURN_START_STRATEGY_OPTIONS.find(
         (option) => option.value === turnStartStrategy,
+    );
+    const selectedEmptyTurnRecovery = EMPTY_TURN_RECOVERY_OPTIONS.find(
+        (option) => option.value === emptyTurnRecovery,
+    );
+    const normalizedIgnorePhrases = useMemo(
+        () => splitPhraseLines(turnStartIgnorePhrases),
+        [turnStartIgnorePhrases],
+    );
+    const normalizedBreakInPhrases = useMemo(
+        () => splitPhraseLines(turnStartBreakInPhrases),
+        [turnStartBreakInPhrases],
     );
     const externalPbxFieldMappingsValid = externalPbxFieldMappings.every(
         (mapping) =>
@@ -318,6 +359,12 @@ function GeneralSection({
             smartTurnStopSecs !== workflowConfigurations.smart_turn_stop_secs ||
             turnStartStrategy !== workflowConfigurations.turn_start_strategy ||
             turnStartMinWords !== workflowConfigurations.turn_start_min_words ||
+            JSON.stringify(normalizedIgnorePhrases) !==
+                JSON.stringify(workflowConfigurations.turn_start_ignore_phrases) ||
+            JSON.stringify(normalizedBreakInPhrases) !==
+                JSON.stringify(workflowConfigurations.turn_start_break_in_phrases) ||
+            greetingMinWords !== workflowConfigurations.greeting_min_words ||
+            emptyTurnRecovery !== workflowConfigurations.empty_turn_recovery ||
             turnStopStrategy !== workflowConfigurations.turn_stop_strategy ||
             contextCompactionEnabled !== workflowConfigurations.context_compaction_enabled ||
             ttsCacheEnabled !== workflowConfigurations.tts_cache_enabled ||
@@ -330,7 +377,7 @@ function GeneralSection({
             JSON.stringify(externalPbxLeadHeaders) !==
             JSON.stringify(workflowConfigurations.external_pbx_lead_headers)
         );
-    }, [name, workflowName, ambientNoiseConfig, maxCallDuration, maxUserIdleTimeout, smartTurnStopSecs, turnStartStrategy, turnStartMinWords, turnStopStrategy, contextCompactionEnabled, ttsCacheEnabled, normalizedCallDispositions, includeTranscriptEndTimestamps, externalPbxFieldMappings, externalPbxLeadHeaders, workflowConfigurations]);
+    }, [name, workflowName, ambientNoiseConfig, maxCallDuration, maxUserIdleTimeout, smartTurnStopSecs, turnStartStrategy, turnStartMinWords, normalizedIgnorePhrases, normalizedBreakInPhrases, greetingMinWords, emptyTurnRecovery, turnStopStrategy, contextCompactionEnabled, ttsCacheEnabled, normalizedCallDispositions, includeTranscriptEndTimestamps, externalPbxFieldMappings, externalPbxLeadHeaders, workflowConfigurations]);
 
     useUnsavedChanges("general", isDirty);
 
@@ -405,6 +452,10 @@ function GeneralSection({
                     smart_turn_stop_secs: smartTurnStopSecs,
                     turn_start_strategy: turnStartStrategy,
                     turn_start_min_words: turnStartMinWords,
+                    turn_start_ignore_phrases: normalizedIgnorePhrases,
+                    turn_start_break_in_phrases: normalizedBreakInPhrases,
+                    greeting_min_words: greetingMinWords,
+                    empty_turn_recovery: emptyTurnRecovery,
                     turn_stop_strategy: turnStopStrategy,
                     context_compaction_enabled: contextCompactionEnabled,
                     tts_cache_enabled: ttsCacheEnabled,
@@ -691,6 +742,81 @@ function GeneralSection({
                             </p>
                         </div>
                     )}
+                    {turnStartStrategy === "min_words" && (
+                        <>
+                            <div className="space-y-2">
+                                <Label htmlFor="turn_start_ignore_phrases" className="text-xs">
+                                    Never Interrupt On
+                                </Label>
+                                <Textarea
+                                    id="turn_start_ignore_phrases"
+                                    rows={4}
+                                    placeholder={SUGGESTED_TURN_START_IGNORE_PHRASES.join("\n")}
+                                    value={turnStartIgnorePhrases}
+                                    onChange={(e) => setTurnStartIgnorePhrases(e.target.value)}
+                                />
+                                <p className="text-xs text-muted-foreground">
+                                    One phrase per line. Speech made only of these is treated as listening, not an interruption, however many words it holds. Case, punctuation and hyphens are ignored. Suggested: {SUGGESTED_TURN_START_IGNORE_PHRASES.join(", ")}.
+                                </p>
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="turn_start_break_in_phrases" className="text-xs">
+                                    Always Interrupt On
+                                </Label>
+                                <Textarea
+                                    id="turn_start_break_in_phrases"
+                                    rows={4}
+                                    placeholder={SUGGESTED_TURN_START_BREAK_IN_PHRASES.join("\n")}
+                                    value={turnStartBreakInPhrases}
+                                    onChange={(e) => setTurnStartBreakInPhrases(e.target.value)}
+                                />
+                                <p className="text-xs text-muted-foreground">
+                                    One phrase per line. Any of these interrupts the agent at once, below the word count. Suggested: {SUGGESTED_TURN_START_BREAK_IN_PHRASES.join(", ")}.
+                                </p>
+                            </div>
+                        </>
+                    )}
+                    <div className="space-y-2">
+                        <Label htmlFor="greeting_min_words" className="text-xs">
+                            Minimum Words To Interrupt The Greeting
+                        </Label>
+                        <Input
+                            id="greeting_min_words"
+                            type="number"
+                            step="1"
+                            min="1"
+                            max="10"
+                            value={greetingMinWords}
+                            onChange={(e) => {
+                                const value = parseInt(e.target.value);
+                                if (!isNaN(value) && value >= 1) setGreetingMinWords(value);
+                            }}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                            Words needed to interrupt the greeting while it plays, whatever the strategy above. The two phrase lists apply here too. Default: {DEFAULT_GREETING_MIN_WORDS}
+                        </p>
+                    </div>
+                    <div className="space-y-2">
+                        <Label htmlFor="empty_turn_recovery" className="text-xs">After A Wordless Interruption</Label>
+                        <Select
+                            value={emptyTurnRecovery}
+                            onValueChange={(value: EmptyTurnRecovery) => setEmptyTurnRecovery(value)}
+                        >
+                            <SelectTrigger id="empty_turn_recovery">
+                                <SelectValue placeholder="Select behaviour" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                {EMPTY_TURN_RECOVERY_OPTIONS.map((option) => (
+                                    <SelectItem key={option.value} value={option.value}>
+                                        {option.label}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                        <p className="text-xs text-muted-foreground">
+                            What the agent does when a cough or a hum cut it off and nothing was transcribed. {selectedEmptyTurnRecovery?.description}
+                        </p>
+                    </div>
                 </div>
 
                 <Separator />

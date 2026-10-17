@@ -6444,6 +6444,30 @@ export type WorkflowConfigurationDefaults = {
      */
     turn_start_min_words?: number;
     /**
+     * Turn Start Ignore Phrases
+     *
+     * Back-channels that never interrupt the bot while it speaks, with the minimum-words strategy. A transcript made only of these is dropped.
+     */
+    turn_start_ignore_phrases?: Array<string>;
+    /**
+     * Turn Start Break In Phrases
+     *
+     * Phrases that interrupt the bot at once, whatever the word count, with the minimum-words strategy.
+     */
+    turn_start_break_in_phrases?: Array<string>;
+    /**
+     * Greeting Min Words
+     *
+     * Transcribed words needed to interrupt the greeting while it plays.
+     */
+    greeting_min_words?: number;
+    /**
+     * Empty Turn Recovery
+     *
+     * After an interruption with no transcript: repeat the question, resume where the bot stopped, or stay silent.
+     */
+    empty_turn_recovery?: 'repeat' | 'resume' | 'silent';
+    /**
      * Turn Stop Strategy
      */
     turn_stop_strategy?: 'transcription' | 'turn_analyzer';

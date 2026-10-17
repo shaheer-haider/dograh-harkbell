@@ -25,6 +25,18 @@ DEFAULT_MAX_USER_IDLE_TIMEOUT_SECONDS = 10.0
 DEFAULT_SMART_TURN_STOP_SECS = 2.0
 DEFAULT_TURN_START_STRATEGY = "min_words"
 DEFAULT_TURN_START_MIN_WORDS = 2
+# Phrase lists for the minimum-words strategy (api/services/pipecat/
+# phrase_turn_start.py). Empty by default: a workflow that never set one runs
+# the plain minimum-words strategy exactly as before.
+MAX_TURN_START_PHRASES = 100
+MAX_TURN_START_PHRASE_LENGTH = 64
+# Words needed to interrupt a greeting while it plays. Two was the literal in
+# GreetingController before it became a setting; it stays the default.
+DEFAULT_GREETING_MIN_WORDS = 2
+# What the bot does after a user turn that interrupted it and ended with no
+# transcript (a cough, a hum the STT could not read). "repeat" is Pipecat's
+# own default: ask the caller to repeat and restate the question.
+DEFAULT_EMPTY_TURN_RECOVERY = "repeat"
 DEFAULT_TURN_STOP_STRATEGY = "transcription"
 DEFAULT_CONTEXT_COMPACTION_ENABLED = False
 MAX_CALL_DISPOSITIONS = 50
@@ -115,6 +127,14 @@ ExternalPBXLeadHeader = Annotated[
 ]
 
 
+TurnStartPhrase = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=MAX_TURN_START_PHRASE_LENGTH
+    ),
+]
+
+
 class AmbientNoiseConfigurationDefaults(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -148,6 +168,34 @@ class WorkflowConfigurationDefaults(BaseModel):
     smart_turn_stop_secs: float = DEFAULT_SMART_TURN_STOP_SECS
     turn_start_strategy: Literal["default", "min_words"] = DEFAULT_TURN_START_STRATEGY
     turn_start_min_words: int = Field(default=DEFAULT_TURN_START_MIN_WORDS, ge=1)
+    turn_start_ignore_phrases: list[TurnStartPhrase] = Field(
+        default_factory=list,
+        max_length=MAX_TURN_START_PHRASES,
+        description=(
+            "Back-channels that never interrupt the bot while it speaks, with "
+            "the minimum-words strategy. A transcript made only of these is dropped."
+        ),
+    )
+    turn_start_break_in_phrases: list[TurnStartPhrase] = Field(
+        default_factory=list,
+        max_length=MAX_TURN_START_PHRASES,
+        description=(
+            "Phrases that interrupt the bot at once, whatever the word count, "
+            "with the minimum-words strategy."
+        ),
+    )
+    greeting_min_words: int = Field(
+        default=DEFAULT_GREETING_MIN_WORDS,
+        ge=1,
+        description="Transcribed words needed to interrupt the greeting while it plays.",
+    )
+    empty_turn_recovery: Literal["repeat", "resume", "silent"] = Field(
+        default=DEFAULT_EMPTY_TURN_RECOVERY,
+        description=(
+            "After an interruption with no transcript: repeat the question, "
+            "resume where the bot stopped, or stay silent."
+        ),
+    )
     turn_stop_strategy: Literal["transcription", "turn_analyzer"] = (
         DEFAULT_TURN_STOP_STRATEGY
     )
@@ -209,6 +257,21 @@ class WorkflowConfigurationDefaults(BaseModel):
                 f"{MAX_CALL_DISPOSITION_DESCRIPTIONS_TOTAL_LENGTH} characters"
             )
         return value
+
+    @field_validator(
+        "turn_start_ignore_phrases", "turn_start_break_in_phrases", mode="before"
+    )
+    @classmethod
+    def strip_turn_start_phrases(cls, value: object) -> object:
+        """Trim, drop blank lines and de-duplicate while preserving order."""
+        if not isinstance(value, list):
+            return value
+        cleaned: list[str] = []
+        for item in value:
+            phrase = item.strip() if isinstance(item, str) else item
+            if phrase and phrase not in cleaned:
+                cleaned.append(phrase)
+        return cleaned
 
     @field_validator("external_pbx_lead_headers", mode="before")
     @classmethod

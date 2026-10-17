@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from api.services.pipecat.phrase_turn_start import create_turn_start_strategy
 from api.services.pipecat.speech_playback import (
     PlaybackOutcome,
     SpeechPlayback,
@@ -41,11 +42,33 @@ class GreetingController:
         self._is_screening = is_screening
         self._user: LLMUserAggregator | None = None
         self._normal_strategies: UserTurnStrategies | None = None
-        self._min_words: int | None = None
+        # Which temporary policy is installed: "greeting", "screening" or None.
+        # Keyed on the policy rather than its threshold because the greeting
+        # threshold is configurable and may equal screening's single word.
+        self._policy: str | None = None
+        self._greeting_min_words = 2
+        self._ignore_phrases: list[str] = []
+        self._break_in_phrases: list[str] = []
         self._turn_text: asyncio.Future[str] | None = None
         self._speech_start: Frame | None = None
         self._playback.on_greeting_finished = self._finished
         self.log_generated_speech: Callable[[str], Awaitable[None]] | None = None
+
+    def configure(
+        self,
+        *,
+        min_words: int,
+        ignore_phrases: list[str] | None = None,
+        break_in_phrases: list[str] | None = None,
+    ) -> None:
+        """Set the greeting's own interruption threshold and phrase lists.
+
+        Called before ``bind`` with the workflow's configuration. Without a
+        call the greeting keeps its historical two-word threshold.
+        """
+        self._greeting_min_words = max(1, int(min_words))
+        self._ignore_phrases = list(ignore_phrases or [])
+        self._break_in_phrases = list(break_in_phrases or [])
 
     def bind(self, user: LLMUserAggregator) -> None:
         self._user = user
@@ -58,31 +81,42 @@ class GreetingController:
         controller = user.user_turn_controller
         greeting_pending = self._playback.greeting_pending
         if greeting_pending:
-            min_words = 2
+            policy = "greeting"
         elif self._is_screening():
-            min_words = 1
+            policy = "screening"
         else:
-            min_words = None
-        if min_words is not None and min_words != self._min_words:
+            policy = None
+        if policy is not None and policy != self._policy:
             if self._normal_strategies is None:
                 self._normal_strategies = controller.user_turn_strategies
-            # Screening admits transcripts; its supervisor decides when to interrupt.
-            strategy = MinWordsUserTurnStartStrategy(
-                min_words=min_words, enable_interruptions=greeting_pending
-            )
+            if greeting_pending:
+                # The greeting's threshold and phrase lists are the workflow's
+                # own (configure); a back-channel never cuts it, a break-in
+                # word always does.
+                strategy = create_turn_start_strategy(
+                    min_words=self._greeting_min_words,
+                    ignore_phrases=self._ignore_phrases,
+                    break_in_phrases=self._break_in_phrases,
+                    enable_interruptions=True,
+                )
+            else:
+                # Screening admits transcripts; its supervisor decides when to interrupt.
+                strategy = MinWordsUserTurnStartStrategy(
+                    min_words=1, enable_interruptions=False
+                )
             if greeting_pending:
                 self._turn_text = asyncio.get_running_loop().create_future()
             await controller.update_strategies(
                 UserTurnStrategies(start=[strategy], stop=self._normal_strategies.stop)
             )
-            self._min_words = min_words
+            self._policy = policy
             if greeting_pending:
                 # Protect queued greetings and account for an earlier bot-start.
                 await strategy.process_frame(BotStartedSpeakingFrame())
-        elif min_words is None and self._normal_strategies is not None:
+        elif policy is None and self._normal_strategies is not None:
             normal = self._normal_strategies
             self._normal_strategies = None
-            self._min_words = None
+            self._policy = None
             await controller.update_strategies(normal)
             # A caller may still be speaking when playback finishes, without
             # having crossed the greeting threshold. Let the restored strategy

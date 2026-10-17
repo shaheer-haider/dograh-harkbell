@@ -22,6 +22,40 @@ export type TurnStopStrategy = NonNullable<GeneratedWorkflowConfigurationDefault
 export type TurnStartStrategy = NonNullable<GeneratedWorkflowConfigurationDefaults["turn_start_strategy"]>;
 export const DEFAULT_TURN_START_STRATEGY: TurnStartStrategy = 'min_words';
 export const DEFAULT_TURN_START_MIN_WORDS = 2;
+export const DEFAULT_GREETING_MIN_WORDS = 2;
+export type EmptyTurnRecovery = NonNullable<GeneratedWorkflowConfigurationDefaults["empty_turn_recovery"]>;
+export const DEFAULT_EMPTY_TURN_RECOVERY: EmptyTurnRecovery = 'repeat';
+
+// Suggested starting points for the two phrase lists. Shown as help text,
+// never applied: an empty list keeps the plain minimum-words behaviour.
+export const SUGGESTED_TURN_START_IGNORE_PHRASES = [
+    'uh-huh', 'mm-hmm', 'mhm', 'yeah', 'yep', 'okay', 'ok', 'right', 'sure', 'i see', 'got it',
+];
+export const SUGGESTED_TURN_START_BREAK_IN_PHRASES = [
+    'stop', 'wait', 'hold on', 'hello', 'hang on', 'excuse me', 'sorry', 'no', 'actually', 'one second',
+];
+
+export const EMPTY_TURN_RECOVERY_OPTIONS: Array<{
+    value: EmptyTurnRecovery;
+    label: string;
+    description: string;
+}> = [
+    {
+        value: 'repeat',
+        label: 'Repeat the question',
+        description: 'Ask the caller to repeat themselves and restate any question they may have missed.',
+    },
+    {
+        value: 'resume',
+        label: 'Carry on',
+        description: 'Continue from where the agent stopped; if its question was already out, wait for the answer.',
+    },
+    {
+        value: 'silent',
+        label: 'Stay silent',
+        description: 'Say nothing after an interruption with no words in it.',
+    },
+];
 
 // "provisional_vad" was retired. Definitions saved before then still carry it,
 // so map it onto the option the backend now resolves such a value to, rather
@@ -105,6 +139,10 @@ type WorkflowConfigurationBase = Omit<
     | "smart_turn_stop_secs"
     | "turn_start_strategy"
     | "turn_start_min_words"
+    | "turn_start_ignore_phrases"
+    | "turn_start_break_in_phrases"
+    | "greeting_min_words"
+    | "empty_turn_recovery"
     | "turn_stop_strategy"
     | "dictionary"
     | "context_compaction_enabled"
@@ -122,6 +160,10 @@ export type WorkflowConfigurations = WorkflowConfigurationBase & {
     smart_turn_stop_secs: number;  // Timeout in seconds for incomplete turn detection
     turn_start_strategy: TurnStartStrategy;  // Strategy for detecting start of user turn/interruption
     turn_start_min_words: number;  // Minimum transcribed words required for minimum-word interruptions
+    turn_start_ignore_phrases: string[];  // Back-channels that never interrupt while the bot speaks
+    turn_start_break_in_phrases: string[];  // Phrases that interrupt at once, whatever the word count
+    greeting_min_words: number;  // Words needed to interrupt the greeting while it plays
+    empty_turn_recovery: EmptyTurnRecovery;  // What the bot does after an interruption with no transcript
     turn_stop_strategy: TurnStopStrategy;  // Strategy for detecting end of user turn
     dictionary?: string;  // Comma-separated words for voice agent to listen for
     voicemail_detection?: VoicemailDetectionConfiguration;
@@ -146,6 +188,10 @@ const FALLBACK_WORKFLOW_CONFIGURATIONS: WorkflowConfigurations = {
     smart_turn_stop_secs: 2,  // 2 seconds
     turn_start_strategy: DEFAULT_TURN_START_STRATEGY,
     turn_start_min_words: DEFAULT_TURN_START_MIN_WORDS,
+    turn_start_ignore_phrases: [],
+    turn_start_break_in_phrases: [],
+    greeting_min_words: DEFAULT_GREETING_MIN_WORDS,
+    empty_turn_recovery: DEFAULT_EMPTY_TURN_RECOVERY,
     turn_stop_strategy: 'transcription',  // Default to transcription-based detection
     dictionary: '',
     transcript_configuration: DEFAULT_TRANSCRIPT_CONFIGURATION,
@@ -190,6 +236,22 @@ export function resolveWorkflowConfigurations(
             configurations?.turn_start_min_words
             ?? defaults?.turn_start_min_words
             ?? FALLBACK_WORKFLOW_CONFIGURATIONS.turn_start_min_words,
+        turn_start_ignore_phrases:
+            configurations?.turn_start_ignore_phrases
+            ?? defaults?.turn_start_ignore_phrases
+            ?? FALLBACK_WORKFLOW_CONFIGURATIONS.turn_start_ignore_phrases,
+        turn_start_break_in_phrases:
+            configurations?.turn_start_break_in_phrases
+            ?? defaults?.turn_start_break_in_phrases
+            ?? FALLBACK_WORKFLOW_CONFIGURATIONS.turn_start_break_in_phrases,
+        greeting_min_words:
+            configurations?.greeting_min_words
+            ?? defaults?.greeting_min_words
+            ?? FALLBACK_WORKFLOW_CONFIGURATIONS.greeting_min_words,
+        empty_turn_recovery:
+            configurations?.empty_turn_recovery
+            ?? defaults?.empty_turn_recovery
+            ?? FALLBACK_WORKFLOW_CONFIGURATIONS.empty_turn_recovery,
         turn_stop_strategy:
             configurations?.turn_stop_strategy
             ?? defaults?.turn_stop_strategy
