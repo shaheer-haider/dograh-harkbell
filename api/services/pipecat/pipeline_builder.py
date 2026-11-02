@@ -101,14 +101,22 @@ def build_agent_generation_pipeline(
     tts,
     generation_callback_processor,
     recording_router=None,
+    spoken_tool_call_filter=None,
 ):
     """Build the generation stage that runs in one agent visit's own worker.
 
     Slots into the gap :func:`build_pipeline` leaves between the user
     aggregator and the output transport, so the frames arriving at the call
     pipeline's transport are the same as if this ran inline.
+
+    ``spoken_tool_call_filter`` goes directly behind the LLM: a tool call the
+    model wrote as text has to be gone before anything treats that text as
+    speech, the transcript-correction callback included.
     """
-    processors = [llm, generation_callback_processor]
+    processors = [llm]
+    if spoken_tool_call_filter is not None:
+        processors.append(spoken_tool_call_filter)
+    processors.append(generation_callback_processor)
     if recording_router:
         processors.append(recording_router)
     processors.append(tts)

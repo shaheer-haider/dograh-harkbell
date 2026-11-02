@@ -54,6 +54,7 @@ from api.services.pipecat.service_factory import (
     create_llm_service,
     get_llm_runtime_configuration,
 )
+from api.services.pipecat.spoken_tool_call_filter import SpokenToolCallFilter
 from api.services.pipecat.tracing_config import (
     build_remote_parent_context,
     get_trace_url,
@@ -737,6 +738,9 @@ async def execute_text_chat_pending_turn(
     pipeline = Pipeline(
         [
             llm,
+            # Ahead of the capture: a tool call the model wrote as text must
+            # not become the bot's reply in a chat any more than in a call.
+            SpokenToolCallFilter(llm=llm, context_provider=lambda: engine.context),
             capture_processor,
             assistant_context_aggregator,
             pipeline_metrics_aggregator,

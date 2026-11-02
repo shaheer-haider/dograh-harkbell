@@ -36,6 +36,7 @@ from api.services.pipecat.service_factory import (
     create_tts_service,
     get_llm_runtime_configuration,
 )
+from api.services.pipecat.spoken_tool_call_filter import SpokenToolCallFilter
 from api.services.workflow.agent_runtime import AgentRuntime, new_visit_id
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.run_creation import definition_to_run
@@ -63,6 +64,9 @@ class AgentGenerationCallbacks:
 
     generation_started: Callable[[], Any]
     llm_text_frame: Callable[[str], Any]
+    # The context the visit's LLM answers from, read when a tool call written
+    # as speech is recovered: only a tool it advertises may run.
+    context: Callable[[], Any] | None = None
 
 
 class AgentRuntimeFactory:
@@ -337,6 +341,9 @@ class AgentRuntimeFactory:
             runtime.tts,
             generation_callbacks,
             recording_router=runtime.recording_router,
+            spoken_tool_call_filter=SpokenToolCallFilter(
+                llm=runtime.llm, context_provider=callbacks.context
+            ),
         )
         call_tracing_context = getattr(self._call_worker, "_tracing_context", None)
         if call_tracing_context is None:
