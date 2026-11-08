@@ -42,6 +42,7 @@ from api.services.pipecat.event_handlers import (
     register_event_handlers,
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
+from api.services.pipecat.keypad import with_keypad_turns
 from api.services.pipecat.phrase_turn_start import (
     create_turn_start_strategy,
     resolve_turn_start_phrases,
@@ -1022,9 +1023,13 @@ async def _run_pipeline_impl(
             run_configs,
             uses_external_turns=uses_external_turns,
         )
-        user_turn_strategies = UserTurnStrategies(
-            start=user_turn_start_strategies,
-            stop=user_turn_stop_strategies,
+        # A keypress is a complete turn of its own, ahead of whatever word
+        # threshold or turn analyzer the workflow configured.
+        user_turn_strategies = with_keypad_turns(
+            UserTurnStrategies(
+                start=user_turn_start_strategies,
+                stop=user_turn_stop_strategies,
+            )
         )
 
     user_turn_stop_timeout = _resolve_user_turn_stop_timeout(

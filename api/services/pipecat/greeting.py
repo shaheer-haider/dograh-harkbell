@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from api.services.pipecat.keypad import keypad_start_strategies
 from api.services.pipecat.phrase_turn_start import create_turn_start_strategy
 from api.services.pipecat.speech_playback import (
     PlaybackOutcome,
@@ -106,8 +107,13 @@ class GreetingController:
                 )
             if greeting_pending:
                 self._turn_text = asyncio.get_running_loop().create_future()
+            # A keypress stays a turn of its own under either policy; the
+            # stop strategies are the normal ones and already carry its own.
             await controller.update_strategies(
-                UserTurnStrategies(start=[strategy], stop=self._normal_strategies.stop)
+                UserTurnStrategies(
+                    start=[*keypad_start_strategies(self._normal_strategies), strategy],
+                    stop=self._normal_strategies.stop,
+                )
             )
             self._policy = policy
             if greeting_pending:

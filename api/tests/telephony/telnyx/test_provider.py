@@ -395,6 +395,7 @@ async def test_telnyx_events_route_rejects_invalid_utf8_body_with_400():
         "call.recording.saved",
         "call.recording.error",
         "call.recording.transcription.saved",
+        "call.dtmf.received",
     ],
 )
 async def test_telnyx_events_route_skips_informational_events_after_verification(

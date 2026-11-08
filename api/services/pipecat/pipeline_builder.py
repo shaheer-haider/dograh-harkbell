@@ -4,6 +4,7 @@ from loguru import logger
 
 from api.services.pipecat.agent_bridge import AGENT_EDGE_EXCLUDED_FRAMES, AgentWorker
 from api.services.pipecat.audio_config import AudioConfig
+from api.services.pipecat.keypad import KeypadAggregator
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import (
@@ -70,6 +71,10 @@ def build_pipeline(
         transport.input(),  # Transport user input
         termination_funnel,
         stt,
+        # Keypresses become "[keypad] <digits>" transcripts, which the keypad
+        # turn strategies make a user turn of their own. Inert on transports
+        # that carry no keypad.
+        KeypadAggregator(),
     ]
 
     if answer_supervisor is not None:

@@ -46,6 +46,9 @@ _INFORMATIONAL_EVENT_TYPES = frozenset(
         "call.recording.saved",
         "call.recording.error",
         "call.recording.transcription.saved",
+        # A keypress also arrives on the call's media stream, which is the copy
+        # the call pipeline acts on; this webhook copy has nothing to add.
+        "call.dtmf.received",
     }
 )
 
