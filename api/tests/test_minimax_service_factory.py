@@ -50,7 +50,7 @@ class TestMiniMaxTTSConfiguration:
 class TestMiniMaxLLMServiceFactory:
     def test_create_minimax_llm_service_uses_openai_compatible(self):
         with patch(
-            "api.services.pipecat.service_factory.MiniMaxLLMService"
+            "api.services.pipecat.service_factory.HarkbellMiniMaxLLMService"
         ) as mock_service:
             mock_service.Settings = RealMiniMaxLLMService.Settings
             create_llm_service_from_provider(
@@ -68,7 +68,7 @@ class TestMiniMaxLLMServiceFactory:
 
     def test_create_minimax_llm_service_custom_base_url(self):
         with patch(
-            "api.services.pipecat.service_factory.MiniMaxLLMService"
+            "api.services.pipecat.service_factory.HarkbellMiniMaxLLMService"
         ) as mock_service:
             mock_service.Settings = RealMiniMaxLLMService.Settings
             create_llm_service_from_provider(
@@ -84,7 +84,7 @@ class TestMiniMaxLLMServiceFactory:
 
     def test_create_minimax_llm_service_passes_user_temperature(self):
         with patch(
-            "api.services.pipecat.service_factory.MiniMaxLLMService"
+            "api.services.pipecat.service_factory.HarkbellMiniMaxLLMService"
         ) as mock_service:
             mock_service.Settings = RealMiniMaxLLMService.Settings
             create_llm_service_from_provider(

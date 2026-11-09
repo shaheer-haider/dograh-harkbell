@@ -34,6 +34,7 @@ from api.services.pipecat.fallback_llm import FallbackLLMProcessor, FallbackRout
 from api.services.pipecat.gemini_json_schema_adapter import (
     DograhGeminiJSONSchemaAdapter,
 )
+from api.services.pipecat.minimax_llm import HarkbellMiniMaxLLMService
 from api.services.pipecat.tool_markup import tool_markup_filter
 from api.utils.url_security import validate_user_configured_service_url
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
@@ -1357,7 +1358,9 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.MINIMAX.value:
         base_url = base_url or "https://api.minimax.io/v1"
         _validate_runtime_service_url(base_url, "base_url")
-        return MiniMaxLLMService(
+        # Harkbell: a tool call MiniMax writes as text never becomes the reply
+        # (minimax_llm.py).
+        return HarkbellMiniMaxLLMService(
             enable_direct_mode=enable_direct_mode,
             api_key=api_key,
             base_url=base_url,
