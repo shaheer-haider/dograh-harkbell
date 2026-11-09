@@ -25,6 +25,14 @@ TOOL_MARKUP_PATTERNS = [
     rf"<({_TOOL_TAGS})\b[^>]*>.*?</\1\s*>",
     r"<parameter\b[^>]*>.*?</parameter\s*>",
     rf"</?(?:{_TOOL_TAGS}|parameter)\b[^>]*>",
+    # A turn that "declines to speak" in an agent framework's own token:
+    # staging round t563a's agent answered "Thanks, bye" by saying NO_REPLY
+    # aloud. The underscore and tag forms are never prose, so they go
+    # anywhere; "[no reply]" only when it is the whole of what would be said.
+    r"<no_reply\s*/?>",
+    r"\[\s*no_reply\s*\]",
+    r"\bNO_REPLY\b",
+    r"^\s*\[no reply\]\s*$",
 ]
 
 

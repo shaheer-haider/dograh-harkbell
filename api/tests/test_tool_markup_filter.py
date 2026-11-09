@@ -50,6 +50,15 @@ def test_each_half_of_a_split_block_loses_its_markup(half, spoken):
     assert run(half) == spoken
 
 
+@pytest.mark.parametrize("token", ["NO_REPLY", " NO_REPLY ", "no_reply", "<no_reply/>", "[no reply]", "[NO_REPLY]"])
+def test_a_no_reply_token_is_never_spoken(token):
+    assert run(token) == ""
+
+
+def test_the_words_no_reply_in_a_sentence_stay():
+    assert run("If there's no reply by Tuesday, call us back.") == "If there's no reply by Tuesday, call us back."
+
+
 def test_the_upstream_function_form_still_goes():
     assert run('Okay <function=end_call>{"x": 1}</function> bye') == "Okay bye"
 
