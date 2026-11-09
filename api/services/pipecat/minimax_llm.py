@@ -1,7 +1,8 @@
 """MiniMax with a tool call written as words kept out of the reply.
 
 Now and then MiniMax M3 returns a tool call in ``delta.content`` in its own
-grammar (``<function_calls><invoke name="…">``, a bare ``<tool_call>``) instead
+grammar (``<function_calls><invoke name="…">``, a bare ``<tool_call>``, or a
+bare JSON object ``{"name": "say_goodbye", "arguments": {}}``) instead
 of as a structured call. ``tool_markup.py`` keeps that text out of speech, but
 the text still became the agent's turn in the conversation, and the model
 copies its own previous turns. On a staging text chat (Harkbell round t656b)
@@ -26,8 +27,8 @@ from openai.types.chat import ChatCompletionChunk
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.minimax.llm import MiniMaxLLMService
 
-_OPENERS = ("<function_calls", "<tool_call", "<minimax:tool_call", "<invoke")
-_OPENER_ANYWHERE = re.compile(r"<(?:function_calls|tool_call|minimax:tool_call|invoke)\b")
+_OPENERS = ("<function_calls", "<tool_call", "<minimax:tool_call", "<invoke", '{"name"', '{ "name"')
+_OPENER_ANYWHERE = re.compile(r'<(?:function_calls|tool_call|minimax:tool_call|invoke)\b|\{\s*"name"\s*:')
 
 
 class _MarkupState(StrEnum):

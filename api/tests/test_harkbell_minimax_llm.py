@@ -81,3 +81,14 @@ async def test_each_response_starts_fresh():
         if chunk.choices[0].delta.content:
             out.append(chunk.choices[0].delta.content)
     assert "".join(out) == "Sorry about that — a gift card, sure."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pieces", [['{"name": "say_goodbye", "arguments": {}}'], ["{", '"name', '": "say_goodbye"', ', "arguments": {}}'], ['{ "name": "end_call", "arguments": {}}']])
+async def test_a_tool_call_written_as_json_says_nothing(pieces):
+    assert await _visible(pieces) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_opens_with_a_brace_but_is_prose_is_said():
+    assert await _visible(["{", "laughs} okay"]) == "{laughs} okay"

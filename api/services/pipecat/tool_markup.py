@@ -29,6 +29,9 @@ TOOL_MARKUP_PATTERNS = [
     # staging round t563a's agent answered "Thanks, bye" by saying NO_REPLY
     # aloud. The underscore and tag forms are never prose, so they go
     # anywhere; "[no reply]" only when it is the whole of what would be said.
+    # The same call as a bare JSON object: production's twin of Mirror Labs
+    # answered "Okay, thanks, bye." with {"name": "say_goodbye", "arguments": {}}.
+    r'\{\s*"name"\s*:\s*"[A-Za-z_][\w.-]*"\s*,\s*"(?:arguments|parameters)"\s*:\s*\{.*?\}\s*\}',
     r"<no_reply\s*/?>",
     r"\[\s*no_reply\s*\]",
     r"\bNO_REPLY\b",

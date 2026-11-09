@@ -69,3 +69,15 @@ def test_the_upstream_function_form_still_goes():
 )
 def test_ordinary_speech_is_untouched(text):
     assert run(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"name": "say_goodbye", "arguments": {}}', ' {"name":"end_call","arguments":{"reason":"done"}} ', '{"name": "question", "parameters": {}}'],
+)
+def test_a_tool_call_written_as_json_is_never_spoken(text):
+    assert run(text) == ""
+
+
+def test_json_that_is_not_a_tool_call_stays():
+    assert run('Your order is {"name": "Grant"}') == 'Your order is {"name": "Grant"}'
