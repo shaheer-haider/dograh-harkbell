@@ -81,3 +81,16 @@ def test_a_tool_call_written_as_json_is_never_spoken(text):
 
 def test_json_that_is_not_a_tool_call_stays():
     assert run('Your order is {"name": "Grant"}') == 'Your order is {"name": "Grant"}'
+
+
+def test_a_fenced_written_call_says_nothing_at_all():
+    # Production run 3881 (T-663): the JSON was removed and the fences spoken.
+    assert run('```json\n{"name": "route_call", "arguments": {"order_number": "55120933"}}\n```') == ""
+    assert run("```json\n\n```") == ""
+    assert run("```") == ""
+
+
+def test_words_around_a_fence_are_kept():
+    assert run('Sure.\n```json\n{"name": "end_call", "arguments": {}}\n```') == "Sure."
+    assert run("```\nSure, tomorrow at seven.\n```") == "Sure, tomorrow at seven."
+    assert run("```Sure thing") == "Sure thing"

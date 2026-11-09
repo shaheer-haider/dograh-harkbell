@@ -32,6 +32,11 @@ TOOL_MARKUP_PATTERNS = [
     # The same call as a bare JSON object: production's twin of Mirror Labs
     # answered "Okay, thanks, bye." with {"name": "say_goodbye", "arguments": {}}.
     r'\{\s*"name"\s*:\s*"[A-Za-z_][\w.-]*"\s*,\s*"(?:arguments|parameters)"\s*:\s*\{.*?\}\s*\}',
+    # And inside a markdown code fence: production's twin answered "Tomorrow
+    # at seven thirty." with ```json, the route_call, and ``` (T-663). The JSON
+    # went above; a fence is never speech, with its language tag when one
+    # ends the line, and the bare pair left behind says nothing.
+    r"```(?:[\w-]+[ \t]*(?=\r?\n))?",
     r"<no_reply\s*/?>",
     r"\[\s*no_reply\s*\]",
     r"\bNO_REPLY\b",
