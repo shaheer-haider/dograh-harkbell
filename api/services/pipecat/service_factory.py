@@ -34,6 +34,7 @@ from api.services.pipecat.fallback_llm import FallbackLLMProcessor, FallbackRout
 from api.services.pipecat.gemini_json_schema_adapter import (
     DograhGeminiJSONSchemaAdapter,
 )
+from api.services.pipecat.tool_markup import tool_markup_filter
 from api.utils.url_security import validate_user_configured_service_url
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
 from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMSettings
@@ -116,7 +117,6 @@ from pipecat.services.speechmatics.stt import (
 )
 from pipecat.services.xai.tts import XAITTSService, XAIWebsocketTTSSettings
 from pipecat.transcriptions.language import Language
-from pipecat.utils.text.xml_function_tag_filter import XMLFunctionTagFilter
 from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 if TYPE_CHECKING:
@@ -732,7 +732,9 @@ def create_tts_service(
     )
 
     # Create function call filter to prevent TTS from speaking function call tags
-    xml_function_tag_filter = XMLFunctionTagFilter()
+    # Harkbell: also MiniMax's own tool-call grammar, which it sometimes
+    # writes as words (tool_markup.py).
+    xml_function_tag_filter = tool_markup_filter()
     if is_deepgram:
         return DeepgramTTSService(
             api_key=user_config.tts.api_key,
