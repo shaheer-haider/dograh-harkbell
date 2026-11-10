@@ -43,7 +43,7 @@ from api.utils.template_renderer import render_template
 
 # Harkbell T-664: what an end-call tool answers before anyone has spoken.
 EARLY_END_REFUSAL = (
-    "Nobody has said anything on this call yet, so it cannot end now. "
+    "The caller has not said anything on this call yet, so it cannot end now. "
     "Greet the caller as your instructions say, and wait for them to answer."
 )
 _MAX_EARLY_END_REFUSALS = 2
@@ -67,11 +67,16 @@ def _message_text(message: Any) -> str:
     return ""
 
 
-def _anyone_has_spoken(context: Any) -> bool:
-    """Whether the caller or the agent has said any words in this conversation.
+def _caller_has_spoken(context: Any) -> bool:
+    """Whether the caller has said any words in this conversation.
+
+    Only the caller's turns count. The agent's own words do not: on `.10`,
+    which counted either side, production copy run 4181 still ended at hello,
+    because the conversation already held agent words before the greeting —
+    the recorded-line notice is spoken as a queued text message.
 
     Unknown counts as yes: the guard only ever holds a call open when it can
-    see that the conversation is empty.
+    see that the caller has said nothing.
     """
     messages = getattr(context, "messages", None) if context is not None else None
     if messages is None:
@@ -80,7 +85,7 @@ def _anyone_has_spoken(context: Any) -> bool:
         role = message.get("role") if isinstance(message, dict) else getattr(
             getattr(message, "message", None), "get", lambda _k: None
         )("role")
-        if role in ("user", "assistant") and _message_text(message).strip():
+        if role == "user" and _message_text(message).strip():
             return True
     return False
 
@@ -514,28 +519,29 @@ class CustomToolManager:
         )
 
     def _refuse_before_anyone_speaks(self, handler, function_name: str):
-        """An end-call tool that cannot end a call nobody has spoken on yet.
+        """An end-call tool that cannot end a call the caller has not spoken on yet.
 
         Harkbell T-664: MiniMax's first act at the greeting was now and then a
         real ``end_call`` or ``say_goodbye`` — production's copy of Mirror Labs,
-        runs 3913, 4072, 4136; staging 3934, 4168 — so the session ended
+        runs 3913, 4072, 4136, 4181; staging 3934, 4168 — so the session ended
         before the caller said a word. On a phone call that is hanging up on
-        them at hello. Until somebody has said something on the call, the tool
+        them at hello. Until the caller has said something on the call, the tool
         answers that it cannot end it yet and the model runs again, which is
         when it greets. Twice per tool per call at most, so a model that keeps
-        insisting is not stuck in a loop; once anyone has spoken the tool is
-        exactly what it was, so a silent caller can still be ended.
+        insisting is not stuck in a loop — which is also how a caller who never
+        speaks is still ended; once the caller has spoken the tool is exactly
+        what it was.
         """
         refusals = 0
 
         async def guarded(function_call_params: FunctionCallParams) -> None:
             nonlocal refusals
-            if refusals < _MAX_EARLY_END_REFUSALS and not _anyone_has_spoken(
+            if refusals < _MAX_EARLY_END_REFUSALS and not _caller_has_spoken(
                 getattr(function_call_params, "context", None)
             ):
                 refusals += 1
                 logger.warning(
-                    f"Refused {function_name} before anyone had spoken ({refusals})"
+                    f"Refused {function_name} before the caller had spoken ({refusals})"
                 )
                 await function_call_params.result_callback(
                     {
