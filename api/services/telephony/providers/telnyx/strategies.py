@@ -21,6 +21,12 @@ from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
 
 TELNYX_API_BASE = "https://api.telnyx.com/v2"
 
+# How long the transfer context outlives the bridge. The destination's
+# ``call.hangup`` after the bridge is what hangs the caller up (see
+# ``routes.py``), and it needs the context to find the caller's leg — so the
+# context has to live as long as the longest conversation the two could have.
+BRIDGED_TRANSFER_CONTEXT_TTL_SECONDS = 6 * 60 * 60
+
 
 class TelnyxConferenceStrategy(TransferStrategy):
     """Joins the caller leg into the conference that the webhook handler
@@ -70,7 +76,17 @@ class TelnyxConferenceStrategy(TransferStrategy):
                     conference_id=conference_id,
                     caller_call_control_id=caller_call_control_id,
                 )
-                await self._cleanup_transfer_context(transfer_context.transfer_id)
+                # Keep the context while the two are bridged. Removing it here
+                # left the destination's post-answer ``call.hangup`` with
+                # nothing to look up: the webhook read it as a pre-answer
+                # failure, published TRANSFER_FAILED to a pipeline that had
+                # already ended, and never hung the caller up — who then sat
+                # alone in the conference until they hung up themselves
+                # (Harkbell, Mirror Labs copy run 4426, 2026-11-10).
+                if joined:
+                    await self._keep_transfer_context(transfer_context)
+                else:
+                    await self._cleanup_transfer_context(transfer_context.transfer_id)
                 return joined
 
         except Exception as e:
@@ -126,6 +142,21 @@ class TelnyxConferenceStrategy(TransferStrategy):
         except Exception as e:
             logger.error(f"[Telnyx Transfer] Error finding transfer context: {e}")
             return None
+
+    async def _keep_transfer_context(self, transfer_context) -> None:
+        """Re-store the context for the life of the bridge, so the
+        destination's hangup can still find and hang up the caller's leg."""
+        try:
+            from api.services.telephony.call_transfer_manager import (
+                get_call_transfer_manager,
+            )
+
+            manager = await get_call_transfer_manager()
+            await manager.store_transfer_context(
+                transfer_context, ttl=BRIDGED_TRANSFER_CONTEXT_TTL_SECONDS
+            )
+        except Exception as e:
+            logger.error(f"[Telnyx Transfer] Error keeping transfer context: {e}")
 
     async def _cleanup_transfer_context(self, transfer_id: str):
         try:
