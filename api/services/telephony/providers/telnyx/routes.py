@@ -203,7 +203,46 @@ async def handle_telnyx_events(
 
     await _process_status_update(workflow_run_id, status_update)
 
+    if event_type == "call.hangup":
+        await _cancel_pending_transfer(
+            caller_call_control_id=str(data.get("payload", {}).get("call_control_id", "")),
+            provider=provider,
+        )
+
     return {"status": "success"}
+
+
+async def _cancel_pending_transfer(
+    *, caller_call_control_id: str, provider: TelnyxProvider
+) -> bool:
+    """Hang the destination up when the caller leaves while it is still ringing.
+
+    The transfer dial is a plain outbound call with its own ``timeout_secs``;
+    nothing tied it to the caller's leg before the bridge. So a caller who hung
+    up five seconds into the ring left the team's phone ringing for the other
+    twenty-five, for nobody (Harkbell, Mirror Labs copy runs 4437 and 4438,
+    2026-11-10). Once bridged, the caller's leg was joined with
+    ``end_conference_on_exit`` and the conference itself takes the
+    destination down, so only a pre-answer context is acted on here.
+    """
+    if not caller_call_control_id:
+        return False
+    call_transfer_manager = await get_call_transfer_manager()
+    context = await call_transfer_manager.find_transfer_context_for_call(
+        caller_call_control_id
+    )
+    if not context or context.conference_id or not context.call_sid:
+        return False
+    logger.info(
+        f"Caller {caller_call_control_id} hung up while transfer "
+        f"{context.transfer_id} was still ringing; hanging up the destination "
+        f"leg {context.call_sid}."
+    )
+    hung_up = await TelnyxHangupStrategy().execute_hangup(
+        {"call_control_id": context.call_sid, "api_key": provider.api_key}
+    )
+    await call_transfer_manager.remove_transfer_context(context.transfer_id)
+    return hung_up
 
 
 @router.post("/telnyx/transfer-result/{transfer_id}")
