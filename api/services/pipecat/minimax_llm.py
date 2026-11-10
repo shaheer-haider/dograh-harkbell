@@ -49,6 +49,14 @@ p99 3.0 s), so a response that has said nothing for ``FIRST_OUTPUT_SECS`` is
 abandoned and asked again, twice, before a last attempt that waits as before;
 and a stream that goes quiet for ``IDLE_SECS`` after it has started ends that
 response with what it said rather than hanging the call.
+
+The guard above sees only the streaming request. The engine also calls the
+model without streaming (`run_inference`: variable extraction, dispositions,
+answer classification), and staging run 4102 hung on `.8` with the stream
+guard silent while Cloudflare showed one shim request held open 60 s — so the
+client this service builds carries ``REQUEST_TIMEOUT`` too: 20 s with nothing
+read ends any request from it, streaming or not, and the OpenAI client's own
+retries (two) ask again.
 """
 
 import asyncio
@@ -58,6 +66,7 @@ from collections.abc import AsyncIterator
 from enum import StrEnum
 from uuid import uuid4
 
+import httpx
 from loguru import logger
 from openai import APITimeoutError
 from openai.types.chat import ChatCompletionChunk
@@ -77,6 +86,8 @@ from pipecat.services.minimax.llm import MiniMaxLLMService
 FIRST_OUTPUT_SECS = 8.0
 STALL_RETRIES = 2
 IDLE_SECS = 8.0
+# Any request from this service's client: 20 s with nothing read, 5 s to connect.
+REQUEST_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
 _FENCE = "```"
 _OPENERS = (
@@ -203,6 +214,12 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._reset_markup_state()
+
+    def create_client(self, *args, **kwargs):
+        # Pipecat's client keeps the OpenAI default of ten minutes; a request
+        # the provider stops answering then holds the turn until something
+        # else gives up (T-667).
+        return super().create_client(*args, **kwargs).with_options(timeout=REQUEST_TIMEOUT)
 
     def _reset_markup_state(self):
         self._markup_state = _MarkupState.DETECTING

@@ -338,3 +338,13 @@ async def test_an_ordinary_stream_passes_through_once_and_is_closed(fast_stalls)
     ok = _Stream([(0.01, "We open "), (0.01, "at ten.")])
     text, handed = await _through_guard([ok])
     assert text == "We open at ten." and len(handed) == 1 and ok.closed
+
+
+def test_every_request_from_the_service_is_bounded():
+    # T-667, staging run 4102: a request held open 60 s while the stream guard
+    # stayed silent. Pipecat's client keeps OpenAI's ten-minute default.
+    import api.services.pipecat.minimax_llm as module
+
+    service = HarkbellMiniMaxLLMService(api_key="test-key", base_url="http://127.0.0.1:9/v1")
+    assert service._client.timeout == module.REQUEST_TIMEOUT
+    assert module.REQUEST_TIMEOUT.read == 20.0 and module.REQUEST_TIMEOUT.connect == 5.0
