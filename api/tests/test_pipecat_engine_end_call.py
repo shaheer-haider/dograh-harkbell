@@ -473,7 +473,7 @@ class TestEndCallViaCustomTool:
         engine._custom_tool_manager = custom_tool_manager
 
         # Manually register the end call handler
-        handler = custom_tool_manager._create_end_call_handler(
+        handler = custom_tool_manager._create_plain_end_call_handler(
             end_call_tool, "end_call_tool"
         )
         llm.register_function("end_call_tool", handler)
@@ -553,7 +553,7 @@ class TestEndCallViaCustomTool:
         engine._custom_tool_manager = custom_tool_manager
 
         # Manually register the end call handler
-        handler = custom_tool_manager._create_end_call_handler(
+        handler = custom_tool_manager._create_plain_end_call_handler(
             end_call_tool, "end_call_with_message"
         )
         llm.register_function("end_call_with_message", handler)
@@ -808,7 +808,7 @@ class TestEndCallRaceConditions:
         custom_tool_manager = CustomToolManager(engine)
         engine._custom_tool_manager = custom_tool_manager
 
-        handler = custom_tool_manager._create_end_call_handler(
+        handler = custom_tool_manager._create_plain_end_call_handler(
             end_call_tool, "end_call_tool"
         )
         llm.register_function("end_call_tool", handler)
@@ -1437,3 +1437,52 @@ class TestOrganizationDispositionMapping:
 
         final = await engine.get_gathered_context()
         assert final["mapped_call_disposition"] == EndTaskReason.USER_HANGUP.value
+
+
+class TestEndCallBeforeAnyoneSpoke:
+    """Harkbell T-664: an end-call tool as the model's first act is refused."""
+
+    @pytest.mark.asyncio
+    async def test_the_agent_greets_instead_of_ending(self, simple_workflow: WorkflowGraph):
+        test_helper = EndCallTestHelper()
+        steps = [
+            MockLLMService.create_function_call_chunks(
+                function_name="end_call_tool", arguments={}, tool_call_id="call_early"
+            ),
+            MockLLMService.create_text_chunks("Hello, thanks for calling."),
+        ]
+        llm = MockLLMService(mock_steps=steps, chunk_delay=0.001)
+        engine, tts, transport, task = await create_engine_with_tracking(
+            simple_workflow, llm, test_helper
+        )
+        manager = CustomToolManager(engine)
+        engine._custom_tool_manager = manager
+        llm.register_function(
+            "end_call_tool",
+            manager._create_end_call_handler(
+                MockEndCallToolModel(message_type="none"), "end_call_tool"
+            ),
+        )
+        with patch(
+            "api.db:db_client.get_organization_id_by_workflow_run_id",
+            new_callable=AsyncMock,
+            return_value=1,
+        ):
+            with patch.object(
+                VariableExtractionManager,
+                "_perform_extraction",
+                new_callable=AsyncMock,
+                return_value={},
+            ):
+                try:
+                    await run_engine_test_pipeline(task, engine, transport, timeout=3)
+                except TimeoutError:
+                    pass
+
+        assert EndTaskReason.END_CALL.value not in test_helper.end_call_reasons
+        said = " ".join(
+            str(m.get("content") or "")
+            for m in engine.context.messages
+            if isinstance(m, dict) and m.get("role") == "assistant"
+        )
+        assert "thanks for calling" in said

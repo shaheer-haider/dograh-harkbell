@@ -41,6 +41,49 @@ from api.services.workflow.tools.transfer_resolver import (
 from api.services.workflow.transfer_introduction import prepare_transfer_introduction
 from api.utils.template_renderer import render_template
 
+# Harkbell T-664: what an end-call tool answers before anyone has spoken.
+EARLY_END_REFUSAL = (
+    "Nobody has said anything on this call yet, so it cannot end now. "
+    "Greet the caller as your instructions say, and wait for them to answer."
+)
+_MAX_EARLY_END_REFUSALS = 2
+
+
+def _message_text(message: Any) -> str:
+    """The words in one context message, whatever shape it carries them in."""
+    if not isinstance(message, dict):
+        message = getattr(message, "message", None)
+        if not isinstance(message, dict):
+            return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _anyone_has_spoken(context: Any) -> bool:
+    """Whether the caller or the agent has said any words in this conversation.
+
+    Unknown counts as yes: the guard only ever holds a call open when it can
+    see that the conversation is empty.
+    """
+    messages = getattr(context, "messages", None) if context is not None else None
+    if messages is None:
+        return True
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else getattr(
+            getattr(message, "message", None), "get", lambda _k: None
+        )("role")
+        if role in ("user", "assistant") and _message_text(message).strip():
+            return True
+    return False
+
 if TYPE_CHECKING:
     from api.services.workflow.mcp_tool_session import McpToolSession
     from api.services.workflow.pipecat_engine import PipecatEngine
@@ -466,6 +509,47 @@ class CustomToolManager:
         return mcp_tool_handler
 
     def _create_end_call_handler(self, tool: Any, function_name: str):
+        return self._refuse_before_anyone_speaks(
+            self._create_plain_end_call_handler(tool, function_name), function_name
+        )
+
+    def _refuse_before_anyone_speaks(self, handler, function_name: str):
+        """An end-call tool that cannot end a call nobody has spoken on yet.
+
+        Harkbell T-664: MiniMax's first act at the greeting was now and then a
+        real ``end_call`` or ``say_goodbye`` — production's copy of Mirror Labs,
+        runs 3913, 4072, 4136; staging 3934, 4168 — so the session ended
+        before the caller said a word. On a phone call that is hanging up on
+        them at hello. Until somebody has said something on the call, the tool
+        answers that it cannot end it yet and the model runs again, which is
+        when it greets. Twice per tool per call at most, so a model that keeps
+        insisting is not stuck in a loop; once anyone has spoken the tool is
+        exactly what it was, so a silent caller can still be ended.
+        """
+        refusals = 0
+
+        async def guarded(function_call_params: FunctionCallParams) -> None:
+            nonlocal refusals
+            if refusals < _MAX_EARLY_END_REFUSALS and not _anyone_has_spoken(
+                getattr(function_call_params, "context", None)
+            ):
+                refusals += 1
+                logger.warning(
+                    f"Refused {function_name} before anyone had spoken ({refusals})"
+                )
+                await function_call_params.result_callback(
+                    {
+                        "status": "refused",
+                        "message": EARLY_END_REFUSAL,
+                    },
+                    properties=FunctionCallResultProperties(run_llm=True),
+                )
+                return
+            await handler(function_call_params)
+
+        return guarded
+
+    def _create_plain_end_call_handler(self, tool: Any, function_name: str):
         """Create a handler function for an end call tool.
 
         Args:
