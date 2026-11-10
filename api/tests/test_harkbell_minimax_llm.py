@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -249,3 +250,91 @@ async def test_pipecat_runs_the_written_call_through_its_own_tool_path():
     calls = service._run_or_defer_function_calls.await_args.args[0]
     assert [(c.function_name, c.arguments) for c in calls] == [("route_call", ROUTE_ARGS)]
     assert service._run_or_defer_function_calls.await_args.kwargs["text_generated"] is False
+
+
+# Harkbell T-667: a response stream that says nothing (copy run 4008: headers,
+# then no token for a minute) is asked again; one that goes quiet mid-reply ends.
+
+
+class _Stream:
+    """A fake response stream: (delay, content) pairs, then the end."""
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.steps:
+            raise StopAsyncIteration
+        delay, content = self.steps.pop(0)
+        await asyncio.sleep(delay)
+        return _chunk(content)
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fast_stalls(monkeypatch):
+    import api.services.pipecat.minimax_llm as module
+
+    monkeypatch.setattr(module, "FIRST_OUTPUT_SECS", 0.05)
+    monkeypatch.setattr(module, "IDLE_SECS", 0.05)
+    monkeypatch.setattr(module, "STALL_RETRIES", 2)
+
+
+async def _through_guard(streams):
+    service = _service()
+    handed = []
+
+    async def completions(self, context):
+        stream = streams.pop(0)
+        handed.append(stream)
+        if isinstance(stream, float):
+            await asyncio.sleep(stream)  # the request itself hangs
+        return stream
+
+    out = []
+    with patch.object(MiniMaxLLMService, "get_chat_completions", completions):
+        async for chunk in service._unstalled(_context()):
+            if chunk.choices[0].delta.content:
+                out.append(chunk.choices[0].delta.content)
+    return "".join(out), handed
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_says_nothing_is_asked_again(fast_stalls):
+    stalled = _Stream([(0.0, None), (1.0, "never")])
+    text, handed = await _through_guard([stalled, _Stream([(0.0, "Sure, "), (0.0, "one moment.")])])
+    assert text == "Sure, one moment."
+    assert len(handed) == 2 and stalled.closed
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_never_answers_is_asked_again(fast_stalls):
+    text, handed = await _through_guard([1.0, _Stream([(0.0, "Hello.")])])
+    assert text == "Hello." and len(handed) == 2
+
+
+@pytest.mark.asyncio
+async def test_after_two_stalls_the_last_attempt_waits_as_before(fast_stalls):
+    slow = _Stream([(0.2, "Slow, "), (0.0, "but here.")])
+    text, handed = await _through_guard([_Stream([(1.0, "x")]), _Stream([(1.0, "y")]), slow])
+    assert text == "Slow, but here." and len(handed) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_goes_quiet_mid_reply_ends_with_what_it_said(fast_stalls):
+    quiet = _Stream([(0.0, "The team will "), (1.0, "never arrives")])
+    text, handed = await _through_guard([quiet, _Stream([(0.0, "a second answer")])])
+    assert text == "The team will " and len(handed) == 1 and quiet.closed
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_stream_passes_through_once_and_is_closed(fast_stalls):
+    ok = _Stream([(0.01, "We open "), (0.01, "at ten.")])
+    text, handed = await _through_guard([ok])
+    assert text == "We open at ten." and len(handed) == 1 and ok.closed

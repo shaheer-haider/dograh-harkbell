@@ -36,8 +36,22 @@ seven thirty." with ```` ```json\\n{"name": "route_call", …}\\n``` ```` (run
   order reaching the team is worse than a turn the caller repeats. The XML
   grammars are only dropped: their values are all strings, and a guessed type
   is the same trade.
+
+And one thing about the stream itself (Harkbell T-667). Now and then the
+response stream through the Fireworks shim stops: the headers arrive, then no
+token for a minute. Nothing gave up on it — the OpenAI client's read timeout
+is ten minutes — so the turn hung until Harkbell's text-chat client timed out
+at 60 s, or on a call until the response watchdog ended the call (staging run
+3941). Cloudflare counted the shim's side of it as "clientDisconnected" after
+~60 s, in heavy hours on 2026-11-05 and through 2026-11-09, before and after
+the engine moved to ECS. A normal turn's output starts within 3.7 s (736 requests,
+p99 3.0 s), so a response that has said nothing for ``FIRST_OUTPUT_SECS`` is
+abandoned and asked again, twice, before a last attempt that waits as before;
+and a stream that goes quiet for ``IDLE_SECS`` after it has started ends that
+response with what it said rather than hanging the call.
 """
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
@@ -45,6 +59,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 from loguru import logger
+from openai import APITimeoutError
 from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import (
     Choice,
@@ -55,6 +70,13 @@ from openai.types.chat.chat_completion_chunk import (
 
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.minimax.llm import MiniMaxLLMService
+
+# T-667: how long a response may say nothing before it is asked again, how
+# many times, and how long a started stream may go quiet. Module constants so a
+# test can shorten them.
+FIRST_OUTPUT_SECS = 8.0
+STALL_RETRIES = 2
+IDLE_SECS = 8.0
 
 _FENCE = "```"
 _OPENERS = (
@@ -130,6 +152,23 @@ def _offered_tool_names(context: LLMContext | None) -> set[str] | None:
     if standard is None:
         return None
     return {tool.name for tool in standard if getattr(tool, "name", None)}
+
+
+def _has_output(chunk: ChatCompletionChunk) -> bool:
+    """Whether a chunk carries something the reply is made of, not just a role or usage."""
+    if not chunk.choices:
+        return False
+    delta = chunk.choices[0].delta
+    return bool(delta and (delta.content or delta.tool_calls))
+
+
+async def _close_stream(stream) -> None:
+    close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception as error:  # a stream that died is closed enough
+            logger.debug(f"closing an abandoned MiniMax stream: {error}")
 
 
 def _content_chunk(text: str) -> ChatCompletionChunk:
@@ -262,8 +301,47 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         return [(name, arguments)]
 
     async def get_chat_completions(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
-        stream = await super().get_chat_completions(context)
-        return self._drop_tool_markup(stream, context)
+        return self._drop_tool_markup(self._unstalled(context), context)
+
+    async def _unstalled(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
+        """The response stream, asked again when it says nothing and ended when it goes quiet."""
+        loop = asyncio.get_running_loop()
+        attempt = 0
+        while True:
+            attempt += 1
+            bounded = attempt <= STALL_RETRIES
+            started = loop.time()
+            try:
+                request = super().get_chat_completions(context)
+                stream = await (asyncio.wait_for(request, FIRST_OUTPUT_SECS) if bounded else request)
+            except (TimeoutError, asyncio.TimeoutError, APITimeoutError):
+                logger.warning(f"MiniMax did not answer within {FIRST_OUTPUT_SECS}s; asking again ({attempt})")
+                continue
+            chunks = stream.__aiter__()
+            said_something = False
+            try:
+                while True:
+                    if said_something:
+                        wait = IDLE_SECS
+                    elif bounded:
+                        wait = max(0.0, FIRST_OUTPUT_SECS - (loop.time() - started))
+                    else:
+                        wait = None
+                    try:
+                        chunk = await (chunks.__anext__() if wait is None else asyncio.wait_for(chunks.__anext__(), wait))
+                    except StopAsyncIteration:
+                        return
+                    except (TimeoutError, asyncio.TimeoutError):
+                        break
+                    if _has_output(chunk):
+                        said_something = True
+                    yield chunk
+            finally:
+                await _close_stream(stream)
+            if said_something:
+                logger.warning(f"MiniMax's stream went quiet for {IDLE_SECS}s mid-reply; ending the reply there")
+                return
+            logger.warning(f"MiniMax's stream said nothing within {FIRST_OUTPUT_SECS}s; asking again ({attempt})")
 
     async def _drop_tool_markup(
         self, stream: AsyncIterator[ChatCompletionChunk], context: LLMContext | None = None
