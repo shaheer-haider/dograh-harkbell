@@ -412,6 +412,65 @@ def test_initiate_call_rejects_existing_run_for_different_workflow():
     assert provider.initiate_call.await_count == 0
 
 
+def test_initiate_call_writes_the_provider_onto_a_precreated_run_before_dialling():
+    """A run made by POST /workflow/{id}/runs has no provider, and the media
+    websocket reads it from initial_context alone — without this write the
+    stream closed before the callee answered and the call was silent."""
+    app = _make_test_app()
+    client = TestClient(app)
+
+    workflow = _workflow()
+    provider = _provider()
+    order = []
+    provider.initiate_call = AsyncMock(
+        side_effect=lambda **_: order.append("dial")
+        or SimpleNamespace(caller_number="+15550001111", provider_metadata={"call_id": "c"})
+    )
+    quota_mock = AsyncMock(return_value=SimpleNamespace(has_quota=True, error_message=""))
+
+    with (
+        patch("api.routes.telephony.db_client") as mock_db,
+        patch("api.routes.telephony.call_concurrency") as mock_concurrency,
+        patch("api.routes.telephony.authorize_workflow_run_start", new=quota_mock),
+        patch(
+            "api.routes.telephony.get_telephony_provider_by_id",
+            new=AsyncMock(return_value=provider),
+        ),
+    ):
+        mock_concurrency.acquire_org_slot = AsyncMock(return_value=object())
+        mock_concurrency.bind_workflow_run = AsyncMock()
+        mock_concurrency.release_slot = AsyncMock()
+        mock_concurrency.release_workflow_run_slot = AsyncMock()
+        mock_db.get_user_configurations = AsyncMock(
+            return_value=SimpleNamespace(test_phone_number=None)
+        )
+        mock_db.get_default_telephony_configuration = AsyncMock(
+            return_value=SimpleNamespace(id=55)
+        )
+        _stub_outbound_setup_lookup(mock_db)
+        mock_db.get_workflow = AsyncMock(return_value=workflow)
+        mock_db.get_workflow_run = AsyncMock(
+            return_value=SimpleNamespace(
+                id=501, workflow_id=workflow.id, name="harkbell-campaign", initial_context={}
+            )
+        )
+        writes = []
+        mock_db.update_workflow_run = AsyncMock(
+            side_effect=lambda **kw: writes.append(kw) or order.append("write")
+        )
+
+        response = client.post(
+            "/telephony/initiate-call",
+            json={"workflow_id": workflow.id, "workflow_run_id": 501, "phone_number": "+15551234567"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert order[0] == "write" and "dial" in order
+    assert writes[0]["initial_context"]["provider"] == "twilio"
+    assert writes[-1]["initial_context"]["provider"] == "twilio"
+    assert not mock_db.create_workflow_run.called
+
+
 def test_initiate_call_rejects_when_concurrency_limit_reached():
     app = _make_test_app()
     client = TestClient(app)

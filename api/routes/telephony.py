@@ -227,6 +227,24 @@ async def initiate_call(
                     detail="workflow_run_workflow_mismatch",
                 )
             workflow_run_name = workflow_run.name
+            # A run created ahead of its dial (POST /workflow/{id}/runs, which
+            # takes only a name and a mode) carries no provider, and the media
+            # websocket reads the provider from initial_context alone: it
+            # closed the stream 0.3 s after the dial, so the callee answered
+            # to silence (Harkbell run 4501, 2026-11-11). Written before the
+            # dial, because Telnyx opens the stream before the dial returns.
+            if (workflow_run.initial_context or {}).get("provider") != provider.PROVIDER_NAME:
+                workflow_run.initial_context = {
+                    **(workflow_run.initial_context or {}),
+                    "provider": provider.PROVIDER_NAME,
+                    "direction": "outbound",
+                    "called_number": phone_number,
+                    "telephony_configuration_id": telephony_configuration_id,
+                }
+                await db_client.update_workflow_run(
+                    run_id=workflow_run_id,
+                    initial_context=workflow_run.initial_context,
+                )
 
         await call_concurrency.bind_workflow_run(concurrency_slot, workflow_run_id)
     except WorkflowRunSlotAlreadyBoundError:
@@ -292,6 +310,7 @@ async def initiate_call(
     # Merge caller_number into initial_context now that we know which number was used
     updated_initial_context = {
         **(workflow_run.initial_context or {}),
+        "provider": provider.PROVIDER_NAME,
         "called_number": phone_number,
         "direction": "outbound",
         "telephony_configuration_id": telephony_configuration_id,
