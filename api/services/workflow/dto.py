@@ -365,6 +365,13 @@ class StartCallNodeData(
     pre_call_fetch_credential_uuid: Optional[str] = spec_field(
         default=None, ui_type=PropertyType.credential_ref
     )
+    # Harkbell T-669: open the call by taking the node's single pathway at once
+    # -- its transition speech, then the next node -- instead of asking the
+    # model for a first reply whose only content is that tool call. Set by the
+    # workflows Harkbell generates; kept out of the node spec and the editor.
+    take_pathway_without_model: bool = spec_field(
+        default=False, ui_type=PropertyType.boolean, spec_exclude=True
+    )
 
     @model_validator(mode="before")
     @classmethod

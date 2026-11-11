@@ -18,6 +18,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     FunctionCallResultProperties,
+    LLMContextFrame,
     SpeechBoundaryFrame,
 )
 from pipecat.pipeline.worker import PipelineWorker
@@ -43,7 +44,7 @@ from api.services.pipecat.speech_playback import (
     SpeechPlaybackTracker,
 )
 from api.services.workflow.agent_runtime import AgentRuntime, new_visit_id
-from api.services.workflow.workflow_graph import Node, WorkflowGraph
+from api.services.workflow.workflow_graph import Edge, Node, WorkflowGraph
 
 if TYPE_CHECKING:
     from pipecat.frames.frames import Frame
@@ -55,7 +56,9 @@ if TYPE_CHECKING:
     LLMService = Union[OpenAILLMService, AnthropicLLMService, GoogleLLMService]
 
 import asyncio
+import json
 import time
+from uuid import uuid4
 
 from loguru import logger
 
@@ -124,7 +127,9 @@ FINAL_EXTRACTION_TIMEOUT_SECONDS = 10.0
 class NodeOpeningResult:
     """The opening action and the playback owned by that invocation."""
 
-    action: Literal["none", "greeting", "llm"]
+    # "pathway": a start node with ``take_pathway_without_model`` moved on
+    # along its edge and no generation was asked for; "llm" when one was.
+    action: Literal["none", "greeting", "llm", "pathway"]
     playback: SpeechPlayback | None = None
 
 
@@ -449,20 +454,11 @@ class PipecatEngine:
                 )
 
                 # Queue transition speech/audio before switching nodes
-                speech_type = transition_speech_type or "text"
-                if (
-                    speech_type == "audio"
-                    and transition_speech_recording_id
-                    and self._fetch_recording_audio
-                ):
-                    logger.info(
-                        f"Playing transition audio: {transition_speech_recording_id}"
-                    )
-                    await self.queue_speech(
-                        recording_pk=int(transition_speech_recording_id), mute_user=True
-                    )
-                elif transition_speech:
-                    await self.queue_text_message(transition_speech, mute_user=True)
+                await self._queue_transition_speech(
+                    transition_speech,
+                    transition_speech_type,
+                    transition_speech_recording_id,
+                )
 
                 # Set context for the new node, so that when the function call result
                 # frame is received by LLMContextAggregator and an LLM generation
@@ -509,6 +505,29 @@ class PipecatEngine:
                 await function_call_params.result_callback(error_result)
 
         return agent.bind_tool(self, transition_func, is_node_transition=True)
+
+    async def _queue_transition_speech(
+        self,
+        transition_speech: Optional[str],
+        transition_speech_type: Optional[str],
+        transition_speech_recording_id: Optional[str],
+    ) -> SpeechPlayback | None:
+        """Queue an edge's transition speech, with the caller muted while it plays."""
+        speech_type = transition_speech_type or "text"
+        if (
+            speech_type == "audio"
+            and transition_speech_recording_id
+            and self._fetch_recording_audio
+        ):
+            logger.info(f"Playing transition audio: {transition_speech_recording_id}")
+            return await self.queue_speech(
+                recording_pk=int(transition_speech_recording_id), mute_user=True
+            )
+        if transition_speech:
+            return await self.queue_speech(
+                transition_speech, append_to_context=False, mute_user=True
+            )
+        return None
 
     async def _register_transition_function_with_llm(
         self,
@@ -1130,6 +1149,17 @@ class PipecatEngine:
                         await speech.wait()
                     return NodeOpeningResult("greeting", speech)
 
+        pathway = self._pathway_without_model(
+            node_id,
+            previous_node_id,
+            opening_context=opening_context,
+            wait_for_playback=wait_for_playback,
+        )
+        if pathway is not None:
+            return await self._open_along_pathway(
+                pathway, agent=agent, generate=generate_if_no_greeting
+            )
+
         if (
             generate_if_no_greeting
             and agent.llm is not None
@@ -1159,6 +1189,122 @@ class PipecatEngine:
             return NodeOpeningResult("llm", speech)
 
         return NodeOpeningResult("none")
+
+    def _pathway_without_model(
+        self,
+        node_id: str,
+        previous_node_id: Optional[str],
+        *,
+        opening_context: LLMContext | None,
+        wait_for_playback: bool,
+    ) -> Edge | None:
+        """The edge a start node takes without asking the model, if it is to.
+
+        Harkbell T-669. A start step that says nothing of its own and has one
+        way on -- the screening line's: its model reply is only the tool call
+        that plays the recorded-line notice -- made the caller's first sound
+        of any kind wait on the language model. On 2026-11-10 a slow Fireworks
+        minute (8-12 s to a first token, four times running) kept a caller in
+        silence for 41 s before the notice. ``take_pathway_without_model``
+        on such a node takes the edge at once instead.
+
+        Only a fresh opening of a flagged start node with exactly one edge to
+        a node that is not an end node qualifies. A resumed node, a realtime
+        model, and an answer-supervised (outbound) opening -- which plays a
+        provisional opening against its own context and waits on it -- keep
+        the model, as does anything without the flag.
+        """
+        node = self.active_agent.workflow.nodes.get(node_id)
+        if (
+            node is None
+            or not node.is_start
+            or not node.take_pathway_without_model
+            or previous_node_id == node_id
+        ):
+            return None
+        reason = None
+        if len(node.out_edges) != 1:
+            reason = f"it has {len(node.out_edges)} pathways, not one"
+        elif self.active_agent.workflow.nodes[node.out_edges[0].target].is_end:
+            reason = "its pathway ends the call"
+        elif self._is_realtime:
+            reason = "a realtime model speaks for itself"
+        elif opening_context is not None or wait_for_playback:
+            reason = "the opening is answer-supervised"
+        if reason:
+            logger.warning(
+                f"Start node {node.name} asks to take its pathway without the "
+                f"model, but {reason}; the model opens the call"
+            )
+            return None
+        return node.out_edges[0]
+
+    async def _open_along_pathway(
+        self, edge: Edge, *, agent: AgentRuntime, generate: bool
+    ) -> NodeOpeningResult:
+        """Take a start node's only edge as if the model had called its tool.
+
+        The same steps as ``transition_func``: the start node's extraction,
+        the edge's transition speech with the caller muted, the next node set,
+        and the tool call and its result in the context, so the next node's
+        model reads the history it reads after a model-made transition. Its
+        first generation is then asked for at once, through the queue the
+        speech went into, so the reply plays behind the notice while the
+        model's first-token time runs under it rather than after it.
+        """
+        node = agent.workflow.nodes[edge.source]
+        logger.info(
+            f"Start node {node.name} takes its pathway {edge.get_function_name()} "
+            "without the model"
+        )
+        await self._perform_variable_extraction_if_needed(
+            node,
+            run_in_background=self._run_transition_variable_extraction_in_background,
+        )
+        speech = await self._queue_transition_speech(
+            edge.transition_speech,
+            edge.data.transition_speech_type,
+            edge.data.transition_speech_recording_id,
+        )
+        if self.context is not None:
+            tool_call_id = f"call_{uuid4().hex[:24]}"
+            self.context.add_message(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": tool_call_id,
+                            "function": {
+                                "name": edge.get_function_name(),
+                                "arguments": "{}",
+                            },
+                            "type": "function",
+                        }
+                    ],
+                }
+            )
+            self.context.add_message(
+                {
+                    "role": "tool",
+                    "content": json.dumps({"status": "done"}),
+                    "tool_call_id": tool_call_id,
+                }
+            )
+        await self.set_node(edge.target, origin_visit_id=agent.visit_id)
+
+        if (
+            not generate
+            or agent.llm is None
+            or self.context is None
+            or self.is_call_disposed()
+        ):
+            return NodeOpeningResult("pathway", speech)
+        self.expect_response()
+        # Behind the transition speech in the same queue, so a text notice
+        # reaches the speech service before any of the reply does. A recording
+        # is already queued at the output by now.
+        await agent.queue_frame(LLMContextFrame(self.context))
+        return NodeOpeningResult("llm", speech)
 
     async def _open_realtime_after_recorded_greeting(
         self, transcript: str | None

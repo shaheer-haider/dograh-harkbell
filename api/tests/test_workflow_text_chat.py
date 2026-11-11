@@ -361,6 +361,91 @@ async def test_text_chat_session_creation_executes_initial_assistant_turn(
 
 
 @pytest.mark.asyncio
+async def test_text_chat_opens_along_a_start_pathway_taken_without_the_model(
+    db_session,
+    async_session,
+    test_client_factory,
+):
+    """Harkbell T-669: a flagged start node's edge is taken without the model.
+
+    The first assistant output is the edge's transition speech, then the next
+    node's reply -- from one generation, made with the next node's prompt.
+    """
+    notice = "You are talking to an AI and this call is recorded."
+    workflow_definition = {
+        "nodes": [
+            {
+                "id": "start",
+                "type": "startCall",
+                "position": {"x": 0, "y": 0},
+                "data": {
+                    "name": "Start",
+                    "prompt": "Take your one pathway silently.",
+                    "greeting": "",
+                    "take_pathway_without_model": True,
+                    "add_global_prompt": False,
+                },
+            },
+            {
+                "id": "main",
+                "type": "agentNode",
+                "position": {"x": 0, "y": 200},
+                "data": {
+                    "name": "Main",
+                    "prompt": "You answer the phone.",
+                    "add_global_prompt": False,
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "start-main",
+                "source": "start",
+                "target": "main",
+                "data": {
+                    "label": "Begin",
+                    "condition": "Always.",
+                    "transition_speech": notice,
+                },
+            }
+        ],
+    }
+    user, workflow = await _create_user_and_workflow(
+        db_session,
+        async_session,
+        workflow_definition=workflow_definition,
+        suffix="pathway",
+    )
+    llm = MockLLMService(
+        mock_steps=[MockLLMService.create_text_chunks("Hi, how can I help?")],
+        chunk_delay=0.001,
+    )
+
+    async with test_client_factory(user) as client:
+        with (
+            patch(
+                "api.services.workflow.text_chat_runner.create_llm_service",
+                return_value=llm,
+            ),
+            patch(
+                "api.services.workflow.text_chat_runner.db_client.has_active_recordings",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            response = await client.post(
+                f"/api/v1/workflow/{workflow.id}/text-chat/sessions",
+                json={"initial_context": {}},
+            )
+    assert response.status_code == 200
+    created = response.json()
+    turn = created["session_data"]["turns"][0]
+    assert turn["assistant_message"]["text"] == f"{notice}\n\nHi, how can I help?"
+    assert created["checkpoint"]["current_node_id"] == "main"
+    # One generation, at the next node.
+    assert llm.get_current_step() == 1
+
+
+@pytest.mark.asyncio
 async def test_text_chat_pre_call_fetch_hydrates_initial_context_once(
     db_session,
     async_session,

@@ -72,6 +72,27 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.utils.enums import RealtimeFeedbackType
+from pipecat.utils.run_context import run_id_var
+
+# A language model's first token later than this is a warning in the logs.
+# A normal turn's first output comes inside 3 s (Harkbell T-667: 736 requests,
+# p99 3.0 s); on 2026-11-10 a slow Fireworks minute ran 6-12 s for four
+# generations in a row and a caller heard 41 s of silence, and it was found by
+# reading one run's ``rtf-ttfb-metric`` events (Harkbell T-669).
+SLOW_LLM_FIRST_TOKEN_SECS = 3.0
+
+
+def warn_if_slow_llm_first_token(
+    *, kind: str, ttfb_seconds: float, processor: str | None, model: str | None
+) -> bool:
+    """Log a warning for a slow language-model first token; True when it did."""
+    if kind != "llm" or ttfb_seconds <= SLOW_LLM_FIRST_TOKEN_SECS:
+        return False
+    logger.warning(
+        f"[run {run_id_var.get()}] Slow language model first token: "
+        f"{round(ttfb_seconds * 1000)} ms ({processor}, {model})"
+    )
+    return True
 
 
 class RealtimeFeedbackObserver(BaseObserver):
@@ -257,6 +278,12 @@ class RealtimeFeedbackObserver(BaseObserver):
                 if isinstance(metric_data, TTFBMetricsData):
                     kind = ttfb_kind(metric_data.processor)
                     if kind:
+                        warn_if_slow_llm_first_token(
+                            kind=kind,
+                            ttfb_seconds=metric_data.value,
+                            processor=metric_data.processor,
+                            model=metric_data.model,
+                        )
                         await self._send_message(
                             build_ttfb_metric_event(
                                 ttfb_seconds=metric_data.value,

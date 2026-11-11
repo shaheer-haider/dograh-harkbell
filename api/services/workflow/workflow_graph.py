@@ -136,6 +136,9 @@ class Node:
         self.tool_uuids = getattr(data, "tool_uuids", None)
         self.document_uuids = getattr(data, "document_uuids", None)
         self.mcp_tool_filters = getattr(data, "mcp_tool_filters", None)
+        self.take_pathway_without_model = (
+            getattr(data, "take_pathway_without_model", False) is True
+        )
         mode = getattr(data, "pre_call_fetch_mode", PreCallFetchMode.disabled)
         self.pre_call_fetch_mode = mode.value if hasattr(mode, "value") else mode
         self.pre_call_fetch_url = getattr(data, "pre_call_fetch_url", None)
@@ -440,7 +443,20 @@ class WorkflowGraph:
         for node in self.nodes.values():
             # Validate StartNode constraints
             if node.node_type == NodeType.startNode:
-                # No specific validations for start node at this time
-                pass
+                # Taking "its pathway" presumes there is exactly one; the engine
+                # would otherwise fall back to the model, silently undoing what
+                # the flag was set for (Harkbell T-669).
+                if node.take_pathway_without_model and len(node.out_edges) != 1:
+                    errors.append(
+                        WorkflowError(
+                            kind=ItemKind.node,
+                            id=node.id,
+                            field="data.take_pathway_without_model",
+                            message=(
+                                "A start node that takes its pathway without the "
+                                "model needs exactly one outgoing pathway."
+                            ),
+                        )
+                    )
 
         return errors
