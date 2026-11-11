@@ -121,7 +121,9 @@ def _greeting_in_assistant_context(context) -> bool:
 
 def _find_processor_by_class_name(pipeline_task, class_name: str):
     """Walk every processor reachable from the task's pipeline (including nested
-    sub-pipelines) and return the first one whose class name matches."""
+    sub-pipelines) and return the first one whose class, or a class it derives
+    from, has that name -- the cascade pipeline's assistant aggregator is
+    Harkbell's subclass of Pipecat's (cut_off.py)."""
     visited: set[int] = set()
     stack = [pipeline_task._pipeline]
     while stack:
@@ -129,7 +131,7 @@ def _find_processor_by_class_name(pipeline_task, class_name: str):
         if id(processor) in visited:
             continue
         visited.add(id(processor))
-        if processor.__class__.__name__ == class_name:
+        if any(cls.__name__ == class_name for cls in type(processor).__mro__):
             return processor
         sub = getattr(processor, "_processors", None)
         if sub:
