@@ -50,6 +50,12 @@ abandoned and asked again, twice, before a last attempt that waits as before;
 and a stream that goes quiet for ``IDLE_SECS`` after it has started ends that
 response with what it said rather than hanging the call.
 
+And one thing about what it says (Harkbell T-662). Now and then MiniMax writes
+its own reasoning as the reply -- "callback_asked is false, so I won't ask
+about a number. … Wait — the caller is Priya, not Dev. Let me re-read." --
+which a caller would hear. ``spoken_reasoning.py`` drops it a sentence at a
+time before it reaches the speech service.
+
 The guard above sees only the streaming request. The engine also calls the
 model without streaming (`run_inference`: variable extraction, dispositions,
 answer classification), and staging run 4102 hung on `.8` with the stream
@@ -77,6 +83,7 @@ from openai.types.chat.chat_completion_chunk import (
     ChoiceDeltaToolCallFunction,
 )
 
+from api.services.pipecat.spoken_reasoning import SpokenReasoningFilter
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.minimax.llm import MiniMaxLLMService
 
@@ -318,7 +325,33 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         return [(name, arguments)]
 
     async def get_chat_completions(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
-        return self._drop_tool_markup(self._unstalled(context), context)
+        return self._drop_spoken_reasoning(self._drop_tool_markup(self._unstalled(context), context))
+
+    async def _drop_spoken_reasoning(
+        self, stream: AsyncIterator[ChatCompletionChunk]
+    ) -> AsyncIterator[ChatCompletionChunk]:
+        """The reply without the model's own reasoning in it (``spoken_reasoning.py``).
+
+        Judged a sentence at a time before anything reaches the speech
+        service, so what is dropped is never said and never becomes the
+        agent's turn in the context. Structured tool calls pass untouched: a
+        reply that was all reasoning says nothing, and its calls still run.
+        """
+        reasoning = SpokenReasoningFilter()
+        try:
+            async for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        delta.content = reasoning.feed(delta.content) or None
+                yield chunk
+            rest = reasoning.finish()
+            if rest:
+                yield _content_chunk(rest)
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
 
     async def _unstalled(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
         """The response stream, asked again when it says nothing and ended when it goes quiet."""
