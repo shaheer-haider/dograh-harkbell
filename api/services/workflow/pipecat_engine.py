@@ -1036,8 +1036,9 @@ class PipecatEngine:
         This is the shared source of truth for how a node begins once the
         engine is ready and the node has already been set on the context.
         Cascade openings share the same greeting policy at call startup and
-        after agent transfers: two words interrupt, and only completed
-        greetings enter assistant context.
+        after agent transfers: two words interrupt, and a completed greeting
+        enters assistant context whole, one the caller cut off as far as it
+        played and marked as cut off (``cut_off.py``).
 
         Args:
             node_id: The node being opened.
@@ -1542,6 +1543,17 @@ class PipecatEngine:
             if speech.done:
                 return speech
             speech.text = text if text is not None else (transcript or "")
+            if audio:
+                # A greeting recording cut off part way keeps the sentences of
+                # its transcript the played audio had reached (cut_off.py).
+                speech.audio_secs = len(audio) / (
+                    2
+                    * (
+                        self._audio_config.pipeline_sample_rate
+                        if self._audio_config
+                        else 16000
+                    )
+                )
             speech.mute_user = mute_user
             await queue_frame(SpeechBoundaryFrame(speech.id, beginning=True))
             for frame in frames:

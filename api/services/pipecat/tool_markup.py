@@ -17,6 +17,9 @@ loses its tags and parameter values in each half rather than being read out.
 Prose around the markup is kept.
 """
 
+import re
+
+from api.services.pipecat.cut_off import CUT_OFF_MARKER
 from pipecat.utils.text.xml_function_tag_filter import XMLFunctionTagFilter
 
 _TOOL_TAGS = r"function_calls|tool_call|minimax:tool_call|invoke"
@@ -41,6 +44,10 @@ TOOL_MARKUP_PATTERNS = [
     r"\[\s*no_reply\s*\]",
     r"\bNO_REPLY\b",
     r"^\s*\[no reply\]\s*$",
+    # The marker a line the caller cut off carries in the context
+    # (cut_off.py). A model copies its own previous turns, so it may write
+    # the marker into a reply; it is never speech.
+    rf"\s*—?\s*{re.escape(CUT_OFF_MARKER)}",
 ]
 
 

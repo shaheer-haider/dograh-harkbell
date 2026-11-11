@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from api.services.pipecat.cut_off import commit_cut_off_line
 from api.services.pipecat.keypad import keypad_start_strategies
 from api.services.pipecat.phrase_turn_start import create_turn_start_strategy
 from api.services.pipecat.speech_playback import (
@@ -29,7 +30,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 
 class GreetingController:
-    """Apply startup turn strategies and commit successfully played greeting text."""
+    """Apply startup turn strategies and commit the greeting text the caller heard."""
 
     def __init__(
         self,
@@ -53,6 +54,7 @@ class GreetingController:
         self._turn_text: asyncio.Future[str] | None = None
         self._speech_start: Frame | None = None
         self._playback.on_greeting_finished = self._finished
+        self._playback.on_greeting_created = self._created
         self.log_generated_speech: Callable[[str], Awaitable[None]] | None = None
 
     def configure(
@@ -159,10 +161,24 @@ class GreetingController:
             return False
         return bool(await asyncio.shield(self._turn_text))
 
+    def _created(self, speech: SpeechPlayback) -> None:
+        context = self._get_context()
+        speech.context_mark = len(context.messages) if context is not None else None
+
     def _finished(self, speech: SpeechPlayback) -> None:
         text = self._playback.greeting_text(speech)
         if text and speech.outcome is PlaybackOutcome.PLAYED:
             self._get_context().add_message({"role": "assistant", "content": text})
+        elif speech.outcome is PlaybackOutcome.INTERRUPTED:
+            # A greeting the caller talked over used to leave nothing, and the
+            # model, seeing no greeting of its own, greeted again -- four times
+            # on one call (cut_off.py, Harkbell T-670). What they heard stays,
+            # marked as cut off.
+            spoken = self._playback.spoken_greeting_text(speech)
+            if spoken:
+                commit_cut_off_line(
+                    self._get_context(), spoken, since=speech.context_mark
+                )
         # Configured greetings use persist_to_logs on their speech request.
         # Generated greetings only know their spoken text after playback.
         if speech.text is None and text and self.log_generated_speech and self._user:

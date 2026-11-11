@@ -37,6 +37,7 @@ from api.services.pipecat.agent_runtime_factory import (
     AgentRuntimeFactory,
 )
 from api.services.pipecat.audio_config import AudioConfig, create_audio_config
+from api.services.pipecat.cut_off import harkbell_context_aggregators
 from api.services.pipecat.event_handlers import (
     register_audio_data_handler,
     register_event_handlers,
@@ -1060,12 +1061,14 @@ async def _run_pipeline_impl(
         )
         user_context_aggregator, assistant_context_aggregator = context_aggregator
     else:
+        # The assistant half keeps what played of a reply the caller cut off,
+        # marked as cut off, so "hello?" over a greeting is not greeted again
+        # (cut_off.py, Harkbell T-670).
         user_context_aggregator, assistant_context_aggregator = (
-            LLMContextAggregatorPair(
+            harkbell_context_aggregators(
                 context,
                 user_params=user_params,
                 assistant_params=assistant_params,
-                realtime_service_mode=False,
             )
         )
         ignore_phrases, break_in_phrases = resolve_turn_start_phrases(run_configs)

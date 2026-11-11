@@ -8,6 +8,7 @@ from typing import Protocol
 
 from loguru import logger
 
+from api.services.pipecat.cut_off import StartedSentence, sentences_started
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     CancelFrame,
@@ -20,6 +21,8 @@ from pipecat.frames.frames import (
     SpeechBoundaryFrame,
     StopFrame,
     TextFrame,
+    TTSStartedFrame,
+    TTSTextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
@@ -78,6 +81,17 @@ class SpeechPlayback:
         self.started = False
         self.text: str | None = None
         self.text_parts: list[TextPartForConcatenation] = []
+        # How much of it reached the caller, for a greeting they cut off
+        # (cut_off.py): the words or sentences reported as played, the
+        # sentence whose audio had begun, and for a recording the seconds
+        # played out of its length.
+        self.spoken_parts: list[TextPartForConcatenation] = []
+        self.started_sentence = StartedSentence()
+        self.audio_secs: float | None = None
+        self.played_secs = 0.0
+        # How long the conversation was when this was asked for, so a cut-off
+        # greeting goes in front of the words that cut it off.
+        self.context_mark: int | None = None
         self._owner = owner
         self._result: asyncio.Future[PlaybackOutcome] = (
             asyncio.get_running_loop().create_future()
@@ -119,6 +133,7 @@ class SpeechPlaybackTracker:
         self.pending: dict[str, SpeechPlayback] = {}
         self.greeting: SpeechPlayback | None = None
         self.on_greeting_finished: Callable[[SpeechPlayback], None] | None = None
+        self.on_greeting_created: Callable[[SpeechPlayback], None] | None = None
         self._output: FrameProcessor | None = None
         # Direct recordings can nest inside a still-generating TTS response.
         self._output_scopes: list[str] = []
@@ -156,6 +171,8 @@ class SpeechPlaybackTracker:
         self.pending[speech.id] = speech
         if greeting:
             self.greeting = speech
+            if self.on_greeting_created:
+                self.on_greeting_created(speech)
         for observer in self._observers:
             observer.on_playback_expected(speech.id)
         return speech
@@ -244,9 +261,18 @@ class SpeechPlaybackTracker:
     def _capture_greeting_text(self, _processor, frame: Frame) -> None:
         """Keep generated greeting text out of context until playback succeeds."""
         speech = self.greeting
-        if not (
-            speech and speech.id in self._output_scopes and isinstance(frame, TextFrame)
-        ):
+        if not (speech and speech.id in self._output_scopes):
+            return
+        if isinstance(frame, TTSStartedFrame):
+            # The greeting reaches the context through GreetingController
+            # alone, whole or cut off; the assistant aggregator must not also
+            # commit a sentence of it it saw begin (cut_off.py).
+            frame.append_to_context = False
+            return
+        if self._output_scopes[-1] == speech.id:
+            # The greeting's own speech, not a message nested inside it.
+            self._note_greeting_progress(speech, frame)
+        if not isinstance(frame, TextFrame):
             return
         if frame.append_to_context and speech.text is None:
             speech.text_parts.append(
@@ -260,6 +286,44 @@ class SpeechPlaybackTracker:
                 )
             )
         frame.append_to_context = False
+
+    @staticmethod
+    def _note_greeting_progress(speech: SpeechPlayback, frame: Frame) -> None:
+        if isinstance(frame, TTSTextFrame) and frame.aggregated_by != "recording":
+            # A recording's transcript passes in front of its audio, so it
+            # says nothing about how much was heard; the audio does.
+            speech.spoken_parts.append(
+                TextPartForConcatenation(
+                    frame.raw_text or frame.text,
+                    includes_inter_part_spaces=frame.includes_inter_frame_spaces,
+                )
+            )
+        elif isinstance(frame, OutputAudioRawFrame) and frame.audio:
+            channels = frame.num_channels or 1
+            if frame.sample_rate:
+                speech.played_secs += len(frame.audio) / (2 * channels * frame.sample_rate)
+        speech.started_sentence.observe(frame)
+
+    @staticmethod
+    def spoken_greeting_text(speech: SpeechPlayback) -> str:
+        """What of a greeting the caller heard before cutting it off.
+
+        Exact where the speech service reported its words; otherwise the
+        sentences that had started playing (cut_off.py).
+        """
+        parts = list(speech.spoken_parts)
+        started = speech.started_sentence
+        if started.part is not None and started.heard:
+            parts.append(started.part)
+        if parts:
+            return concatenate_aggregated_text(parts).strip()
+        if speech.text and speech.played_secs > 0:
+            fraction = (
+                speech.played_secs / speech.audio_secs if speech.audio_secs else 0.0
+            )
+            # With no length to measure against, any audio is the first sentence.
+            return sentences_started(speech.text, max(fraction, 1e-9))
+        return ""
 
     @staticmethod
     def greeting_text(speech: SpeechPlayback) -> str:

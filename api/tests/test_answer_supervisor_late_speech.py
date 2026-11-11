@@ -36,6 +36,7 @@ from pipecat.turns.user_stop import (
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from api.schemas.answer_supervisor import AnswerSupervisorConfig
+from api.services.pipecat.cut_off import mark_cut_off
 from api.services.pipecat.agent_bridge import AgentBridgeProcessor
 from api.services.pipecat.answer_classification import MachineSubtype
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
@@ -1484,9 +1485,15 @@ async def test_human_after_screening_answers_when_recorded_greeting_already_ran(
 @pytest.mark.parametrize("greeting_type", ["text", "audio", "llm"])
 @pytest.mark.parametrize("flush_before_interruption", [False, True])
 @pytest.mark.parametrize("supervised", [False, True])
-async def test_interrupted_greeting_text_is_logged_but_excluded_from_inference(
+async def test_interrupted_greeting_is_logged_once_and_kept_as_far_as_it_played(
     simple_workflow, greeting_type, flush_before_interruption, supervised
 ):
+    """A greeting the caller talks over reaches inference as heard, marked cut off.
+
+    It used to be left out entirely, and the model, seeing no greeting of its
+    own, greeted again (Harkbell T-670). The recording here never plays a byte
+    -- the output is held -- so nothing of it is kept.
+    """
     history = [{"role": "assistant", "content": "Welcome."}]
     async with late_call(
         simple_workflow,
@@ -1516,8 +1523,14 @@ async def test_interrupted_greeting_text_is_logged_but_excluded_from_inference(
         assert await c.engine.drain_call_pipeline()
         assert c.speech.outcome is PlaybackOutcome.INTERRUPTED
         # Preserve prior history even when its text matches the greeting.
+        heard = (
+            []
+            if greeting_type == "audio"
+            else [{"role": "assistant", "content": mark_cut_off("Welcome.")}]
+        )
         assert c.generation_messages[-1] == [
             *history,
+            *heard,
             {"role": "user", "content": "Wait please."},
         ]
         events = await c.persisted()
