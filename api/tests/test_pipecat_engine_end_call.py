@@ -1443,7 +1443,16 @@ class TestEndCallBeforeAnyoneSpoke:
     """Harkbell T-664: an end-call tool as the model's first act is refused."""
 
     @pytest.mark.asyncio
-    async def test_the_agent_greets_instead_of_ending(self, simple_workflow: WorkflowGraph):
+    async def test_the_call_waits_for_the_caller_instead_of_ending(
+        self, simple_workflow: WorkflowGraph
+    ):
+        """Refused, and not run again on the refusal (production run 4615).
+
+        The refusal used to run the model again so that it would greet; it
+        said goodbye instead, and the third goodbye was let through. Now the
+        engine says the step's greeting if it has one -- this start step has
+        none -- and the next turn is the caller's.
+        """
         test_helper = EndCallTestHelper()
         steps = [
             MockLLMService.create_function_call_chunks(
@@ -1480,9 +1489,10 @@ class TestEndCallBeforeAnyoneSpoke:
                     pass
 
         assert EndTaskReason.END_CALL.value not in test_helper.end_call_reasons
+        assert llm.get_current_step() == 1
         said = " ".join(
             str(m.get("content") or "")
             for m in engine.context.messages
             if isinstance(m, dict) and m.get("role") == "assistant"
         )
-        assert "thanks for calling" in said
+        assert "thanks for calling" not in said
