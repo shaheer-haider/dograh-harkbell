@@ -78,9 +78,11 @@ class ElevenLabsLike(MockTTSService):
             yield frame
 
 
-async def _run_4603():
+async def _run_4603(*, main_greeting=None, hello_after=1.5 * SENTENCE_SECS + 0.3):
     graph = WorkflowGraph(
-        ReactFlowDTO.model_validate(screening_definition(notice_audio=True))
+        ReactFlowDTO.model_validate(
+            screening_definition(notice_audio=True, main_greeting=main_greeting)
+        )
     )
 
     async def fetch_recording(*, recording_pk=None, recording_id=None):
@@ -89,13 +91,16 @@ async def _run_4603():
             transcript="You are talking to an AI and this call is recorded.",
         )
 
+    reply = MockLLMService.create_text_chunks("Yes, I'm here. How can I help you?")
     llm = ContextCapturingMockLLM(
-        mock_steps=[
-            MockLLMService.create_text_chunks(GREETING),
-            MockLLMService.create_text_chunks("Yes, I'm here. How can I help you?"),
-        ],
+        # With a greeting of its own the step says it, and the model's first
+        # turn is the reply to "Hello?".
+        mock_steps=[reply]
+        if main_greeting
+        else [MockLLMService.create_text_chunks(GREETING), reply],
         chunk_delay=0.001,
     )
+    replies = 1 if main_greeting else 2
     tts = ElevenLabsLike()
     transport = MockTransport(
         params=TransportParams(
@@ -146,8 +151,8 @@ async def _run_4603():
         )
 
         async def caller():
-            # The notice, then the greeting's first sentence and a half.
-            await asyncio.sleep(NOTICE_SECS + 1.5 * SENTENCE_SECS + 0.3)
+            # The notice, then part of the greeting.
+            await asyncio.sleep(NOTICE_SECS + hello_after)
             for frame in (
                 ProposedUserStartedSpeakingFrame(),
                 InterimTranscriptionFrame("Hello", "caller", ""),
@@ -157,7 +162,7 @@ async def _run_4603():
                 await task.queue_frame(frame)
                 await asyncio.sleep(0.05)
             async with asyncio.timeout(8):
-                while len(llm.captured_contexts) < 2:
+                while len(llm.captured_contexts) < replies:
                     await asyncio.sleep(0.02)
             await asyncio.sleep(0.2)
             await task.cancel()
@@ -191,3 +196,19 @@ async def test_the_reply_to_hello_sees_the_greeting_as_cut_off():
     # And it sits in front of the caller's words.
     roles = [m.get("role") for m in messages if m.get("role") in ("assistant", "user") and m.get("content")]
     assert roles == ["assistant", "user"]
+
+
+@pytest.mark.asyncio
+async def test_a_configured_greeting_after_the_notice_is_kept_as_cut_off_too():
+    # Config 192: the screening main step opens with its own greeting.
+    # A configured greeting is one utterance to the speech service, so here
+    # its whole second of audio carries all three sentences: cut in at half.
+    llm = await _run_4603(main_greeting=GREETING, hello_after=0.55)
+    assert len(llm.captured_contexts) == 1
+    messages = llm.get_context_at_step(0)["messages"]
+    said = [m["content"] for m in messages if m.get("role") == "assistant" and m.get("content")]
+    assert len(said) == 1, said
+    assert said[0].startswith("Hi, this is"), said
+    assert said[0].endswith(f"— {CUT_OFF_MARKER}"), said
+    assert "How can I help you?" not in said[0], said
+    assert not any(m.get("tool_calls") for m in messages)

@@ -1089,67 +1089,14 @@ class PipecatEngine:
             return NodeOpeningResult("none")
 
         if previous_node_id != node_id:
-            greeting_info = self.get_node_greeting(node_id)
-            if greeting_info:
-                greeting_type, greeting_value = greeting_info
-                if (
-                    greeting_type in {"audio", "audio_recording_id"}
-                    and greeting_value
-                    and self._fetch_recording_audio
-                    and self._transport_output is not None
-                ):
-                    logger.info(f"Playing audio greeting recording: {greeting_value}")
-                    fetch_kwargs = (
-                        {"recording_id": greeting_value}
-                        if greeting_type == "audio_recording_id"
-                        else {"recording_pk": int(greeting_value)}
-                    )
-                    speech = await self.queue_speech(
-                        **fetch_kwargs,
-                        append_to_context=True,
-                        persist_to_logs=False,
-                        mute_user=mute_user,
-                        greeting=not self._is_realtime,
-                    )
-                    if speech.outcome is not PlaybackOutcome.FAILED:
-                        if wait_for_playback:
-                            await speech.wait()
-                        await self._open_realtime_after_recorded_greeting(speech.text)
-                        return NodeOpeningResult("greeting", speech)
-                    logger.warning(
-                        f"Failed to fetch audio greeting {greeting_value}, "
-                        "falling back to LLM generation"
-                    )
-                elif greeting_value and agent.worker is not None:
-                    logger.info("Playing text greeting via TTS")
-                    # Completed greeting playback is retained in context so
-                    # the LLM knows the caller has already been greeted.
-                    if self._is_realtime:
-                        # Realtime adapters consume the opening text as a prompt
-                        # and generate a response; configured tool text is skipped.
-                        speech = self.speech_playback.expect_response(
-                            source=agent.llm, mute_user=mute_user
-                        )
-                        try:
-                            await agent.speak(
-                                greeting_value,
-                                append_to_context=True,
-                                persist_to_logs=False,
-                            )
-                        except BaseException:
-                            speech.finish(PlaybackOutcome.FAILED)
-                            raise
-                    else:
-                        speech = await self.queue_speech(
-                            greeting_value,
-                            append_to_context=True,
-                            persist_to_logs=False,
-                            mute_user=mute_user,
-                            greeting=True,
-                        )
-                    if wait_for_playback:
-                        await speech.wait()
-                    return NodeOpeningResult("greeting", speech)
+            opened = await self.queue_node_greeting(
+                node_id,
+                agent=agent,
+                mute_user=mute_user,
+                wait_for_playback=wait_for_playback,
+            )
+            if opened is not None:
+                return opened
 
         pathway = self._pathway_without_model(
             node_id,
@@ -1191,6 +1138,85 @@ class PipecatEngine:
             return NodeOpeningResult("llm", speech)
 
         return NodeOpeningResult("none")
+
+    async def queue_node_greeting(
+        self,
+        node_id: str,
+        *,
+        agent: AgentRuntime | None = None,
+        mute_user: bool = False,
+        wait_for_playback: bool = False,
+    ) -> NodeOpeningResult | None:
+        """Play a node's configured greeting under the greeting policy.
+
+        Interruptible on the greeting's own threshold, committed to the
+        context whole when it plays through and as far as it played when the
+        caller cuts it off (``GreetingController``). None when the node has
+        no greeting, or a recorded one could not be fetched.
+        """
+        agent = agent or self._active_agent
+        greeting_info = self.get_node_greeting(node_id)
+        if greeting_info:
+            greeting_type, greeting_value = greeting_info
+            if (
+                greeting_type in {"audio", "audio_recording_id"}
+                and greeting_value
+                and self._fetch_recording_audio
+                and self._transport_output is not None
+            ):
+                logger.info(f"Playing audio greeting recording: {greeting_value}")
+                fetch_kwargs = (
+                    {"recording_id": greeting_value}
+                    if greeting_type == "audio_recording_id"
+                    else {"recording_pk": int(greeting_value)}
+                )
+                speech = await self.queue_speech(
+                    **fetch_kwargs,
+                    append_to_context=True,
+                    persist_to_logs=False,
+                    mute_user=mute_user,
+                    greeting=not self._is_realtime,
+                )
+                if speech.outcome is not PlaybackOutcome.FAILED:
+                    if wait_for_playback:
+                        await speech.wait()
+                    await self._open_realtime_after_recorded_greeting(speech.text)
+                    return NodeOpeningResult("greeting", speech)
+                logger.warning(
+                    f"Failed to fetch audio greeting {greeting_value}, "
+                    "falling back to LLM generation"
+                )
+            elif greeting_value and agent.worker is not None:
+                logger.info("Playing text greeting via TTS")
+                # Completed greeting playback is retained in context so
+                # the LLM knows the caller has already been greeted.
+                if self._is_realtime:
+                    # Realtime adapters consume the opening text as a prompt
+                    # and generate a response; configured tool text is skipped.
+                    speech = self.speech_playback.expect_response(
+                        source=agent.llm, mute_user=mute_user
+                    )
+                    try:
+                        await agent.speak(
+                            greeting_value,
+                            append_to_context=True,
+                            persist_to_logs=False,
+                        )
+                    except BaseException:
+                        speech.finish(PlaybackOutcome.FAILED)
+                        raise
+                else:
+                    speech = await self.queue_speech(
+                        greeting_value,
+                        append_to_context=True,
+                        persist_to_logs=False,
+                        mute_user=mute_user,
+                        greeting=True,
+                    )
+                if wait_for_playback:
+                    await speech.wait()
+                return NodeOpeningResult("greeting", speech)
+        return None
 
     def _pathway_without_model(
         self,
@@ -1265,6 +1291,16 @@ class PipecatEngine:
         it was still playing, a "Hello?" over it found nothing left to mark
         cut off, and the model, seeing a greeting it believed was heard,
         greeted again.
+
+        A next node with a greeting of its own opens with that greeting
+        instead, after the transition speech, and the model's first turn is
+        after the caller speaks. Production run 4615 (``-harkbell.16``): asked
+        to open the screening line's main step, the model read the pathway's
+        tool call and its ``{"status": "done"}`` as a check to report on --
+        "No issues found with the recording line notice." -- then tried to
+        say goodbye three times, and the caller was never greeted. With a
+        greeting there is nothing for the model to do yet, so no tool call is
+        written into the context either.
         """
         node = agent.workflow.nodes[edge.source]
         logger.info(
@@ -1280,7 +1316,8 @@ class PipecatEngine:
             edge.data.transition_speech_type,
             edge.data.transition_speech_recording_id,
         )
-        if self.context is not None:
+        greets = self.get_node_greeting(edge.target) is not None
+        if self.context is not None and not greets:
             tool_call_id = f"call_{uuid4().hex[:24]}"
             self.context.add_message(
                 {
@@ -1306,6 +1343,18 @@ class PipecatEngine:
             )
         await self.set_node(edge.target, origin_visit_id=agent.visit_id)
 
+        if greets:
+            if speech is None or speech.done or not self.speech_playback.has_media_output:
+                # Text chat has no clock to keep in step: the greeting follows
+                # the notice in the same queue.
+                await self._greet_after_transition_speech(None, agent, edge.target)
+            else:
+                self._track_pathway_task(
+                    self._greet_after_transition_speech(speech, agent, edge.target),
+                    agent,
+                )
+            return NodeOpeningResult("greeting", speech)
+
         if (
             not generate
             or agent.llm is None
@@ -1319,13 +1368,37 @@ class PipecatEngine:
         if speech is None or speech.done:
             await agent.queue_frame(LLMContextFrame(self.context))
         else:
-            task = asyncio.create_task(
-                self._generate_after_transition_speech(speech, agent),
-                name=f"pathway-generation-{agent.visit_id}",
+            self._track_pathway_task(
+                self._generate_after_transition_speech(speech, agent), agent
             )
-            self._pathway_generations.add(task)
-            task.add_done_callback(self._pathway_generations.discard)
         return NodeOpeningResult("llm", speech)
+
+    def _track_pathway_task(self, coroutine, agent: AgentRuntime) -> None:
+        task = asyncio.create_task(coroutine, name=f"pathway-{agent.visit_id}")
+        self._pathway_generations.add(task)
+        task.add_done_callback(self._pathway_generations.discard)
+
+    async def _greet_after_transition_speech(
+        self, speech: SpeechPlayback | None, agent: AgentRuntime, node_id: str
+    ) -> None:
+        """Play the next node's greeting once the pathway's speech is over.
+
+        After it, not beside it, for the reason the first generation waits:
+        a word-timed speech service stamps the greeting's words from when it
+        made them, so queued behind a recording they would reach the context
+        before the caller heard them, and a "Hello?" over the greeting would
+        find nothing left to mark cut off.
+        """
+        if speech is not None:
+            await speech.wait()
+        if self.is_call_disposed() or agent.retired:
+            return
+        opened = await self.queue_node_greeting(node_id, agent=agent)
+        if opened is None and agent.llm is not None and self.context is not None:
+            # A recorded greeting that could not be fetched: the model opens.
+            logger.warning(f"Node {node_id}'s greeting could not play; the model opens")
+            self.expect_response()
+            await agent.queue_frame(LLMContextFrame(self.context))
 
     async def _generate_after_transition_speech(
         self, speech: SpeechPlayback, agent: AgentRuntime

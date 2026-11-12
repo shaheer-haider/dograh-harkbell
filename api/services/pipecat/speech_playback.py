@@ -157,6 +157,11 @@ class SpeechPlaybackTracker:
         return any(speech.mute_user for speech in self.pending.values())
 
     @property
+    def has_media_output(self) -> bool:
+        """Whether speech plays out through a real output; text chat has none."""
+        return self._output is not None
+
+    @property
     def greeting_pending(self) -> bool:
         return self.greeting is not None and not self.greeting.done
 

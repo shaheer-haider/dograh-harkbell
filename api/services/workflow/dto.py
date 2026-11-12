@@ -484,7 +484,21 @@ class AgentNodeData(
     _ExtractionNodeDataMixin,
     _ToolDocumentRefsMixin,
 ):
-    pass
+    # Harkbell T-669: the greeting a step opens with when a start node's
+    # pathway enters it without the model (``take_pathway_without_model``),
+    # and that the early-end guard speaks if nobody has greeted the caller.
+    # Read nowhere else -- an agent node is otherwise entered mid-conversation
+    # and says nothing of its own. Set by the workflows Harkbell generates;
+    # kept out of the node spec and the editor.
+    greeting: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.string, spec_exclude=True
+    )
+    greeting_type: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.options, spec_exclude=True
+    )
+    greeting_recording_id: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.recording_ref, spec_exclude=True
+    )
 
 
 @node_spec(

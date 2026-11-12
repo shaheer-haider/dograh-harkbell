@@ -51,7 +51,9 @@ START_PROMPT = "START PROMPT: take your one pathway silently."
 MAIN_PROMPT = "MAIN PROMPT: greet the caller."
 
 
-def screening_definition(*, flag=True, edges=None, notice_audio=False) -> dict:
+def screening_definition(
+    *, flag=True, edges=None, notice_audio=False, main_greeting=None
+) -> dict:
     """Harkbell's screening shape: an empty start step, one edge, the notice on it."""
     start_data = {
         "name": "harkbell-start",
@@ -87,6 +89,7 @@ def screening_definition(*, flag=True, edges=None, notice_audio=False) -> dict:
                     "prompt": MAIN_PROMPT,
                     "allow_interrupt": True,
                     "add_global_prompt": False,
+                    **({"greeting": main_greeting} if main_greeting is not None else {}),
                 },
             },
             {
@@ -411,6 +414,9 @@ async def _text_chat_opening(graph: WorkflowGraph, llm):
             previous_node_id=None,
             generate_if_no_greeting=True,
         )
+        if opening.action != "llm":
+            # As the runner does when the opening asked the model for nothing.
+            window.pending_context_requests = max(0, window.pending_context_requests - 1)
         await _wait_for_quiescence(
             capture_processor=capture,
             response_window=window,
