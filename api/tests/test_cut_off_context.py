@@ -341,3 +341,23 @@ async def test_a_generated_greeting_cut_off_is_kept_once(call):
     assert speech.outcome is PlaybackOutcome.INTERRUPTED
     # GreetingController commits it; the aggregator must not add a second copy.
     assert call.assistant_messages() == [f"Hi, this is Emma at Mirror Labs. — {CUT_OFF_MARKER}"]
+
+
+def test_committing_a_cut_off_line_is_logged_at_info():
+    from loguru import logger
+
+    from api.services.pipecat.cut_off import commit_cut_off_line
+    from pipecat.utils.run_context import set_current_run_id
+
+    seen = []
+    sink = logger.add(lambda message: seen.append(str(message)), level="INFO")
+    try:
+        set_current_run_id(4603)
+        context = LLMContext()
+        commit_cut_off_line(context, "Hi, this is Emma at", since=0)
+    finally:
+        logger.remove(sink)
+    assert context.messages == [
+        {"role": "assistant", "content": f"Hi, this is Emma at — {CUT_OFF_MARKER}"}
+    ]
+    assert any("[run 4603] Kept a line the caller cut off: 19 chars" in line for line in seen)

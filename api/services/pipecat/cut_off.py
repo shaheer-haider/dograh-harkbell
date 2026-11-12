@@ -51,6 +51,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.utils.string import TextPartForConcatenation
+from pipecat.utils.run_context import run_id_var
 from pipecat.utils.time import time_now_iso8601
 
 # Short, and bracketed so a model reading its own history takes it as a fact
@@ -77,6 +78,13 @@ def commit_cut_off_line(context: LLMContext, spoken: str, *, since: int | None) 
     unfinished reply to continue.
     """
     message = {"role": "assistant", "content": mark_cut_off(spoken)}
+    # INFO, so production can see that it happened: run 4603's "Hello?" left
+    # no trace in the engine's log and the question had to be answered from
+    # the model's reply alone.
+    logger.info(
+        f"[run {run_id_var.get()}] Kept a line the caller cut off: "
+        f"{len(spoken.strip())} chars"
+    )
     messages = list(context.messages)
     position = len(messages)
     if since is not None and since <= position:
@@ -132,13 +140,25 @@ class StartedSentence:
         self.part: TextPartForConcatenation | None = None
         self.context_id: str | None = None
         self.heard = False
+        # Once the speech service has reported a word, it reports every word
+        # as it plays and the spoken text is exact: its sentence
+        # announcements are not consulted again. They can run ahead of the
+        # audio there -- production run 4603's reply to "Hello?" was handed a
+        # greeting sentence that had not begun to play.
+        self.word_timed = False
 
     def observe(self, frame: Frame) -> None:
         if isinstance(frame, TTSTextFrame):
             # Its words (or the sentence itself) reached the listener: from
             # here the spoken text is exact.
+            if frame.aggregated_by == "word":
+                self.word_timed = True
             self.clear()
-        elif isinstance(frame, AggregatedTextFrame) and frame.will_be_spoken:
+        elif (
+            isinstance(frame, AggregatedTextFrame)
+            and frame.will_be_spoken
+            and not self.word_timed
+        ):
             self.part = _part(frame)
             self.context_id = frame.context_id
             self.heard = False

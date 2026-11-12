@@ -197,6 +197,8 @@ class PipecatEngine:
         # and so can never transfer.
         self._agent_factory = None
         self._transfer_coordinator = None
+        # Next-node generations waiting on a start pathway's transition speech.
+        self._pathway_generations: set[asyncio.Task] = set()
         self.context = context
         self._call_context_vars = call_context_vars
         self._workflow_run_id = workflow_run_id
@@ -1248,9 +1250,21 @@ class PipecatEngine:
         the edge's transition speech with the caller muted, the next node set,
         and the tool call and its result in the context, so the next node's
         model reads the history it reads after a model-made transition. Its
-        first generation is then asked for at once, through the queue the
-        speech went into, so the reply plays behind the notice while the
-        model's first-token time runs under it rather than after it.
+        first generation is asked for once the transition speech has
+        finished playing, as after a model-made transition, where the tool
+        result waits for the bot to stop speaking.
+
+        It was asked for at once in ``-harkbell.15``, to hide the model's
+        first-token time under the notice, and that broke the greeting's
+        place in the context (production run 4603). A speech service with
+        word timings stamps each word from when it synthesised it, not from
+        when it will play, and it does not know a four-second recording sits
+        in front of it at the output. So the greeting's words, and the end of
+        the response, reached the assistant aggregator four seconds before
+        the caller heard them: the whole greeting was committed as said while
+        it was still playing, a "Hello?" over it found nothing left to mark
+        cut off, and the model, seeing a greeting it believed was heard,
+        greeted again.
         """
         node = agent.workflow.nodes[edge.source]
         logger.info(
@@ -1299,12 +1313,28 @@ class PipecatEngine:
             or self.is_call_disposed()
         ):
             return NodeOpeningResult("pathway", speech)
+        # Declared before the speech plays out, so the notice finishing does
+        # not read as the end of a response and start the idle timer.
         self.expect_response()
-        # Behind the transition speech in the same queue, so a text notice
-        # reaches the speech service before any of the reply does. A recording
-        # is already queued at the output by now.
-        await agent.queue_frame(LLMContextFrame(self.context))
+        if speech is None or speech.done:
+            await agent.queue_frame(LLMContextFrame(self.context))
+        else:
+            task = asyncio.create_task(
+                self._generate_after_transition_speech(speech, agent),
+                name=f"pathway-generation-{agent.visit_id}",
+            )
+            self._pathway_generations.add(task)
+            task.add_done_callback(self._pathway_generations.discard)
         return NodeOpeningResult("llm", speech)
+
+    async def _generate_after_transition_speech(
+        self, speech: SpeechPlayback, agent: AgentRuntime
+    ) -> None:
+        """Ask for the next node's first reply once the pathway's speech is over."""
+        await speech.wait()
+        if self.is_call_disposed() or agent.retired or self.context is None:
+            return
+        await agent.queue_frame(LLMContextFrame(self.context))
 
     async def _open_realtime_after_recorded_greeting(
         self, transcript: str | None
