@@ -347,15 +347,17 @@ def test_committing_a_cut_off_line_is_logged_at_info():
     from loguru import logger
 
     from api.services.pipecat.cut_off import commit_cut_off_line
-    from pipecat.utils.run_context import set_current_run_id
+    from pipecat.utils.run_context import run_id_var
 
     seen = []
     sink = logger.add(lambda message: seen.append(str(message)), level="INFO")
+    # Reset afterwards: the run id is a context variable other tests read.
+    token = run_id_var.set("4603")
     try:
-        set_current_run_id(4603)
         context = LLMContext()
         commit_cut_off_line(context, "Hi, this is Emma at", since=0)
     finally:
+        run_id_var.reset(token)
         logger.remove(sink)
     assert context.messages == [
         {"role": "assistant", "content": f"Hi, this is Emma at — {CUT_OFF_MARKER}"}
