@@ -366,6 +366,18 @@ class CallMonitorProcessor(FrameProcessor):
         self._response_watch = None
         self._waiting_for_user = False
 
+    def await_caller(self) -> None:
+        """Drop the current response and wait for the caller, idle timer armed.
+
+        For a response that ends in a tool the engine refused without running
+        the model again (an end-call tool before the caller has spoken): it
+        produced nothing audible and owes nothing more, so waiting on it would
+        only run the response deadline out and end the call as unresponsive.
+        """
+        self.cancel()
+        self._waiting_for_user = True
+        self._arm_idle()
+
     def close(self) -> None:
         """Release the deadline and subscriptions at call closure."""
         self._closed = True

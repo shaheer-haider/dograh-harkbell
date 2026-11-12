@@ -29,6 +29,7 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
+from api.services.workflow.pipecat_engine_callbacks import IDLE_PROMPTS
 from api.services.workflow.tools.calculator import get_calculator_tools, safe_calculator
 from api.services.workflow.tools.custom_tool import (
     execute_http_tool,
@@ -41,12 +42,13 @@ from api.services.workflow.tools.transfer_resolver import (
 from api.services.workflow.transfer_introduction import prepare_transfer_introduction
 from api.utils.template_renderer import render_template
 
-# Harkbell T-664: what an end-call tool answers before anyone has spoken.
+# Harkbell T-664: what an end-call tool answers before anyone has spoken. The
+# model is not run on it: the engine greets, if the call has not been greeted,
+# and the next turn is the caller's.
 EARLY_END_REFUSAL = (
     "The caller has not said anything on this call yet, so it cannot end now. "
-    "Greet the caller as your instructions say, and wait for them to answer."
+    "Wait for the caller to speak."
 )
-_MAX_EARLY_END_REFUSALS = 2
 
 
 def _message_text(message: Any) -> str:
@@ -82,10 +84,23 @@ def _caller_has_spoken(context: Any) -> bool:
     if messages is None:
         return True
     for message in messages:
-        role = message.get("role") if isinstance(message, dict) else getattr(
-            getattr(message, "message", None), "get", lambda _k: None
-        )("role")
-        if role == "user" and _message_text(message).strip():
+        text = _message_text(message).strip()
+        if _role(message) == "user" and text and text not in IDLE_PROMPTS:
+            return True
+    return False
+
+
+def _role(message: Any) -> str | None:
+    if not isinstance(message, dict):
+        message = getattr(message, "message", None)
+    return message.get("role") if isinstance(message, dict) else None
+
+
+def _agent_has_spoken(context: Any) -> bool:
+    """Whether the agent's own words are in the conversation: a greeting, whole
+    or cut off, or a reply. Transition speech never enters it."""
+    for message in getattr(context, "messages", None) or []:
+        if _role(message) == "assistant" and _message_text(message).strip():
             return True
     return False
 
@@ -519,41 +534,63 @@ class CustomToolManager:
         )
 
     def _refuse_before_anyone_speaks(self, handler, function_name: str):
-        """An end-call tool that cannot end a call the caller has not spoken on yet.
+        """An end-call tool that cannot end a call the caller has not spoken on.
 
         Harkbell T-664: MiniMax's first act at the greeting was now and then a
         real ``end_call`` or ``say_goodbye`` — production's copy of Mirror Labs,
         runs 3913, 4072, 4136, 4181; staging 3934, 4168 — so the session ended
         before the caller said a word. On a phone call that is hanging up on
-        them at hello. Until the caller has said something on the call, the tool
-        answers that it cannot end it yet and the model runs again, which is
-        when it greets. Twice per tool per call at most, so a model that keeps
-        insisting is not stuck in a loop — which is also how a caller who never
-        speaks is still ended; once the caller has spoken the tool is exactly
-        what it was.
+        them at hello. Until the caller has said something, the tool refuses.
+
+        It used to refuse twice and let the third through, so that a model
+        insisting was not looped, and that third one is how production run
+        4615 (``-harkbell.16``) ended: the model was never told to greet, said
+        goodbye three times, and the caller -- who had not yet said a word --
+        heard "thanks for calling Mirror Labs, have a good day" and nothing
+        else. Now it never lets one through, and the refusal does not run the
+        model again, so there is no loop to escape: the engine greets the
+        caller with the step's own greeting if nobody has greeted them yet,
+        and the next turn is the caller's. A caller who never speaks is still
+        ended -- by the engine's own silence handling
+        (``pipecat_engine_callbacks.handle_user_idle``), which ends the call
+        without going through this tool.
         """
-        refusals = 0
 
         async def guarded(function_call_params: FunctionCallParams) -> None:
-            nonlocal refusals
-            if refusals < _MAX_EARLY_END_REFUSALS and not _caller_has_spoken(
-                getattr(function_call_params, "context", None)
-            ):
-                refusals += 1
-                logger.warning(
-                    f"Refused {function_name} before the caller had spoken ({refusals})"
-                )
-                await function_call_params.result_callback(
-                    {
-                        "status": "refused",
-                        "message": EARLY_END_REFUSAL,
-                    },
-                    properties=FunctionCallResultProperties(run_llm=True),
-                )
+            context = getattr(function_call_params, "context", None)
+            if _caller_has_spoken(context):
+                await handler(function_call_params)
                 return
-            await handler(function_call_params)
+            logger.warning(f"Refused {function_name} before the caller had spoken")
+            await self._greet_instead_of_ending(context)
+            await function_call_params.result_callback(
+                {"status": "refused", "message": EARLY_END_REFUSAL},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
 
         return guarded
+
+    async def _greet_instead_of_ending(self, context: Any) -> None:
+        """Greet a caller nobody has greeted yet, then wait for them."""
+        engine = getattr(self, "_engine", None)
+        if engine is None:
+            return
+        monitor = engine.call_monitor
+        # The refused response is over and asked nothing more of the model, so
+        # its watch must not wait on a reply that is never coming.
+        if engine.__dict__.get("_greeted_after_refused_end") or _agent_has_spoken(context):
+            monitor.await_caller()
+            return
+        engine._greeted_after_refused_end = True
+        node = engine.active_agent.current_node
+        monitor.cancel()
+        opened = (
+            await engine.queue_node_greeting(node.id, agent=engine.active_agent)
+            if node is not None
+            else None
+        )
+        if opened is None:
+            monitor.await_caller()
 
     def _create_plain_end_call_handler(self, tool: Any, function_name: str):
         """Create a handler function for an end call tool.

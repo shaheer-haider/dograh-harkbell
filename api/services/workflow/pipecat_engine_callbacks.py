@@ -28,14 +28,24 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+# The engine's own words to the model when the caller is silent. They go in as
+# user messages, and the early-end guard must not mistake them for the caller
+# speaking (pipecat_engine_custom_tools.py, Harkbell T-664).
+IDLE_PROMPTS = (
+    "The user has been quiet. Politely and briefly ask if they're still there in the language that the user has been speaking so far.",
+    "The user has been quiet. We will be disconnecting the call now. Wish them a good day in the language that the user has been speaking so far.",
+)
+
+
 async def handle_user_idle(engine: "PipecatEngine", aggregator, attempt: int) -> None:
-    """Execute the monitor's idle decision; timing and retry state live there."""
+    """Execute the monitor's idle decision; timing and retry state live there.
+
+    The second silence ends the call here, from the engine, not through an
+    end-call tool: a caller who never speaks is ended even though the model
+    may never end a call the caller has not spoken on.
+    """
     logger.info(f"Handling user_idle, attempt: {attempt}")
-    content = (
-        "The user has been quiet. Politely and briefly ask if they're still there in the language that the user has been speaking so far."
-        if attempt == 1
-        else "The user has been quiet. We will be disconnecting the call now. Wish them a good day in the language that the user has been speaking so far."
-    )
+    content = IDLE_PROMPTS[0] if attempt == 1 else IDLE_PROMPTS[1]
     await aggregator.push_frame(
         LLMMessagesAppendFrame([{"role": "user", "content": content}], run_llm=True)
     )
