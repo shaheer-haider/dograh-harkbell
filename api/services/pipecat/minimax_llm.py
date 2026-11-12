@@ -54,7 +54,8 @@ And one thing about what it says (Harkbell T-662). Now and then MiniMax writes
 its own reasoning as the reply -- "callback_asked is false, so I won't ask
 about a number. … Wait — the caller is Priya, not Dev. Let me re-read." --
 which a caller would hear. ``spoken_reasoning.py`` drops it a sentence at a
-time before it reaches the speech service.
+time before it reaches the speech service, and ``greeting_repeats.py`` keeps
+a later reply from saying the call's greeting again.
 
 The guard above sees only the streaming request. The engine also calls the
 model without streaming (`run_inference`: variable extraction, dispositions,
@@ -83,6 +84,11 @@ from openai.types.chat.chat_completion_chunk import (
     ChoiceDeltaToolCallFunction,
 )
 
+from api.services.pipecat.greeting_repeats import (
+    GreetingRepeatGuard,
+    caller_has_spoken,
+    greeting_from_context,
+)
 from api.services.pipecat.spoken_reasoning import SpokenReasoningFilter
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.minimax.llm import MiniMaxLLMService
@@ -221,6 +227,8 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._reset_markup_state()
+        # The call's greeting as it was sent to be spoken (greeting_repeats.py).
+        self._greeting: str | None = None
 
     def create_client(self, *args, **kwargs):
         # Pipecat's client keeps the OpenAI default of ten minutes; a request
@@ -325,10 +333,29 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         return [(name, arguments)]
 
     async def get_chat_completions(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
-        return self._drop_spoken_reasoning(self._drop_tool_markup(self._unstalled(context), context))
+        # The call's greeting: once a caller has spoken, a reply may not say
+        # it again (greeting_repeats.py). Remembered as it was sent to be
+        # spoken; a service built for one text-chat turn reads it back from
+        # the context instead.
+        repeats = None
+        opening = False
+        if caller_has_spoken(context):
+            greeting = self._greeting or greeting_from_context(context)
+            repeats = GreetingRepeatGuard(greeting) if greeting else None
+        else:
+            opening = self._greeting is None
+        return self._drop_spoken_reasoning(
+            self._drop_tool_markup(self._unstalled(context), context),
+            repeats=repeats,
+            opening=opening,
+        )
 
     async def _drop_spoken_reasoning(
-        self, stream: AsyncIterator[ChatCompletionChunk]
+        self,
+        stream: AsyncIterator[ChatCompletionChunk],
+        *,
+        repeats: GreetingRepeatGuard | None = None,
+        opening: bool = False,
     ) -> AsyncIterator[ChatCompletionChunk]:
         """The reply without the model's own reasoning in it (``spoken_reasoning.py``).
 
@@ -337,7 +364,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         agent's turn in the context. Structured tool calls pass untouched: a
         reply that was all reasoning says nothing, and its calls still run.
         """
-        reasoning = SpokenReasoningFilter()
+        reasoning = SpokenReasoningFilter(repeats=repeats)
         try:
             async for chunk in stream:
                 if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta:
@@ -348,6 +375,8 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
             rest = reasoning.finish()
             if rest:
                 yield _content_chunk(rest)
+            if opening and reasoning.said.strip():
+                self._greeting = reasoning.said.strip()
         finally:
             close = getattr(stream, "aclose", None)
             if close is not None:

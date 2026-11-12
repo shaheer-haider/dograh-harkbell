@@ -36,6 +36,7 @@ import re
 from loguru import logger
 
 from api.services.pipecat.cut_off import CUT_OFF_MARKER
+from api.services.pipecat.greeting_repeats import GreetingRepeatGuard
 
 # A parameter or tool name: lower_snake_case. Not part of an email address or a
 # web address, and not an address being read out ("first_last at gmail").
@@ -88,11 +89,16 @@ def opens_with_self_talk(sentence: str) -> bool:
 class SpokenReasoningFilter:
     """One response's text, sentence by sentence, without the reasoning in it."""
 
-    def __init__(self):
+    def __init__(self, repeats: "GreetingRepeatGuard | None" = None):
         self._buffer = ""
         self._held: list[str] = []
         self._reasoning = False
         self._dropped: list[str] = []
+        # The call's greeting, when this reply must not say it again
+        # (greeting_repeats.py).
+        self._repeats = repeats
+        # Everything this reply has handed on to be spoken.
+        self.said = ""
 
     def feed(self, text: str) -> str:
         """Take the next piece of the stream; return what may be said now."""
@@ -120,8 +126,13 @@ class SpokenReasoningFilter:
         """The response has ended: settle what is held and what is left."""
         said = self._sentence(self._buffer)
         self._buffer = ""
-        said += "".join(self._held)
+        said += self._release(self._held)
         self._held = []
+        if self._repeats is not None:
+            instead = self._repeats.settle(said_anything=bool(self.said.strip()))
+            if instead:
+                said += instead
+                self.said += instead
         if self._dropped:
             logger.warning(
                 "MiniMax spoke its own reasoning; dropped from the reply: "
@@ -142,7 +153,7 @@ class SpokenReasoningFilter:
         if sentence.strip() and opens_with_self_talk(sentence):
             self._held.append(sentence)
             return ""
-        released = "".join(self._held) + sentence
+        released = self._release([*self._held, sentence])
         self._held = []
         return released
 
@@ -150,6 +161,16 @@ class SpokenReasoningFilter:
         if self._reasoning:
             self._reasoning = False
             return ""
-        released = "".join(self._held)
+        released = self._release([*self._held, gap])
         self._held = []
-        return released + gap
+        return released
+
+    def _release(self, pieces: list[str]) -> str:
+        """Hand sentences on to be spoken, less any repeat of the greeting."""
+        kept = "".join(
+            piece
+            for piece in pieces
+            if self._repeats is None or not piece.strip() or self._repeats.keep(piece)
+        )
+        self.said += kept
+        return kept
