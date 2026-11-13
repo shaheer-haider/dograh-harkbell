@@ -558,7 +558,7 @@ class CustomToolManager:
 
         async def guarded(function_call_params: FunctionCallParams) -> None:
             context = getattr(function_call_params, "context", None)
-            if _caller_has_spoken(context):
+            if _caller_has_spoken(context) or self._realtime_caller_heard():
                 await handler(function_call_params)
                 return
             logger.warning(f"Refused {function_name} before the caller had spoken")
@@ -569,6 +569,21 @@ class CustomToolManager:
             )
 
         return guarded
+
+    def _realtime_caller_heard(self) -> bool:
+        """Whether a realtime provider has heard the caller, ahead of the context.
+
+        Harkbell. A realtime model answers the caller's audio, and the
+        transcript of that audio is written to the context only once it
+        arrives -- after a reply that is nothing but a tool call has already
+        run. On the copy a sales caller's and a wrong number's first hang-up
+        were both refused as "the caller has not said anything", 36 ms before
+        their words reached the context (runs 4888, 4889); the model then hung
+        up again, the second time without its sentence.
+        """
+        engine = getattr(self, "_engine", None)
+        agent = getattr(engine, "active_agent", None) if engine is not None else None
+        return bool(getattr(getattr(agent, "llm", None), "caller_speech_heard", False))
 
     async def _greet_instead_of_ending(self, context: Any) -> None:
         """Greet a caller nobody has greeted yet, then wait for them."""

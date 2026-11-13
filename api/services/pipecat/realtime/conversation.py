@@ -45,6 +45,11 @@ class RealtimeConversationMixin:
         # tool's, so nothing the model hears or says after it may reach the
         # caller (``close_conversation``).
         self._conversation_closed = False
+        # Harkbell: the provider has heard the caller finish a stretch of
+        # speech, or the caller pressed a key. A realtime model acts on the
+        # audio; its transcript reaches the context a moment later, which is
+        # too late for a guard that reads the context (``caller_speech_heard``).
+        self.caller_speech_heard = False
         # The engine assigns _context before the first context frame arrives.
         self._handled_initial_context = False
         self._workflow_tool_deferral = WorkflowToolCallDeferral(self)

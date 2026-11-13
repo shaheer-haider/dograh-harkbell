@@ -67,10 +67,36 @@ class DograhOpenAIRealtimeLLMService(
         # A one-off prompt that arrived while a reply was still being made:
         # that reply is cancelled, and the prompt is answered once it has ended.
         self._run_llm_after_response_done = False
+        # Harkbell: a response this service asked for itself has already had its
+        # start frame pushed; the provider's own "assistant item added" would
+        # push a second (``push_frame``).
+        self._manual_response_start_pushed = False
 
     # ------------------------------------------------------------------
     # Provider frames: ephemeral prompts and tool-call deferral
     # ------------------------------------------------------------------
+
+    async def push_frame(
+        self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
+    ):
+        """One start frame per response, also for the ones asked for by hand.
+
+        Harkbell. ``_send_manual_response_create`` pushes the response's start
+        frame itself -- the greeting, an idle check, a keypress -- and the
+        provider's "assistant item added" then pushed another. The engine's
+        speech tracker tags the first with the speech it is waiting for and the
+        second with a fresh id, and the response's end closes the second: the
+        greeting it was waiting on never ended, and was released by its 35 s
+        timeout instead. On a silent line that put the first "are you still
+        there?" fifty seconds after the greeting, not twenty (copy run 4886).
+        """
+        if (
+            isinstance(frame, LLMFullResponseStartFrame)
+            and self._manual_response_start_pushed
+        ):
+            self._manual_response_start_pushed = False
+            return
+        await super().push_frame(frame, direction)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         if isinstance(frame, LLMMessagesAppendFrame):
@@ -93,6 +119,14 @@ class DograhOpenAIRealtimeLLMService(
             return
 
         appended_any = False
+        if any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and str(message.get("content", "")).startswith("[keypad]")
+            for message in frame.messages
+        ):
+            # A keypress is the caller acting, as much as a word is.
+            self.caller_speech_heard = True
         for message in frame.messages:
             item = self._message_to_conversation_item(message)
             if item is None:
@@ -282,7 +316,9 @@ class DograhOpenAIRealtimeLLMService(
         tool_choice: str | None = None,
     ):
         """Trigger inference after manually appending conversation items."""
+        self._manual_response_start_pushed = False
         await self.push_frame(LLMFullResponseStartFrame())
+        self._manual_response_start_pushed = True
         await self.start_processing_metrics()
         await self.start_ttfb_metrics()
         await self.send_client_event(
@@ -294,6 +330,12 @@ class DograhOpenAIRealtimeLLMService(
                 )
             )
         )
+
+    async def _handle_evt_speech_stopped(self, evt):
+        # Muted audio is silence the provider never calls speech, so this is
+        # the caller's own voice.
+        self.caller_speech_heard = True
+        await super()._handle_evt_speech_stopped(evt)
 
     async def close_conversation(self) -> None:
         await super().close_conversation()
@@ -355,6 +397,9 @@ class DograhOpenAIRealtimeLLMService(
             logger.error(f"Failed to process function call arguments: {e}")
 
     async def _handle_evt_response_done(self, evt):
+        # A response that was only a tool call adds no assistant item, so the
+        # flag would otherwise swallow the next response's start.
+        self._manual_response_start_pushed = False
         await super()._handle_evt_response_done(evt)
         if self._run_llm_after_response_done:
             self._run_llm_after_response_done = False
