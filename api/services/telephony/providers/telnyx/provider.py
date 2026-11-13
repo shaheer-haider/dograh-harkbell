@@ -4,6 +4,7 @@ Uses the Telnyx Call Control API v2 for outbound calling with
 inline WebSocket media streaming.
 """
 
+import asyncio
 import base64
 import binascii
 import json
@@ -25,7 +26,9 @@ TELNYX_PUBLIC_KEY_BYTES = 32
 TELNYX_SIGNATURE_BYTES = 64
 
 from api.enums import TelephonyCallStatus, WorkflowRunMode
+from api.db import db_client
 from api.services.telephony import ws_auth
+from api.services.telephony.providers.telnyx import stream_recovery
 from api.services.telephony.base import (
     CallInitiationResult,
     NormalizedInboundData,
@@ -357,12 +360,28 @@ class TelnyxProvider(TelephonyProvider):
         1. "connected" event on WebSocket open
         2. "start" event with stream_id, call_control_id, media_format
         3. "media" events with base64-encoded audio
+
+        On an answered inbound call a socket that brings no "start" within
+        ``stream_recovery.START_TIMEOUT_SECS`` is restarted once, then hung up
+        (Harkbell T-679, ``stream_recovery.py``).
         """
         from api.services.pipecat.run_pipeline import run_pipeline_telephony
 
+        accepted = stream_recovery.accepted_at(websocket) or time.monotonic()
+        second_socket = stream_recovery.is_second_socket(websocket)
+        call_control_id_hint = await self._answered_inbound_call(
+            workflow_run_id, organization_id
+        )
+        deadline = (
+            accepted + stream_recovery.START_TIMEOUT_SECS
+            if call_control_id_hint
+            else None
+        )
+        received: list[str] = []
+
         try:
             # Wait for "connected" event
-            first_msg = await websocket.receive_text()
+            first_msg = await self._receive_before(websocket, deadline)
             msg = json.loads(first_msg)
 
             if msg.get("event") != "connected":
@@ -370,12 +389,17 @@ class TelnyxProvider(TelephonyProvider):
                 await websocket.close(code=4400, reason="Expected connected event")
                 return
 
-            logger.debug(
-                f"Telnyx WebSocket connected for workflow_run {workflow_run_id}"
+            received.append("connected")
+            # INFO, with the time since the socket was accepted: on runs 4727
+            # and 4735 the socket sat silent for the whole call and the logs
+            # could not say which of these two never came.
+            logger.info(
+                f"[run {workflow_run_id}] Telnyx media socket: 'connected' after "
+                f"{_ms_since(accepted)} ms"
             )
 
             # Wait for "start" event with stream details
-            start_msg = await websocket.receive_text()
+            start_msg = await self._receive_before(websocket, deadline)
             logger.debug(f"Received start message: {start_msg}")
 
             start_data = json.loads(start_msg)
@@ -383,6 +407,11 @@ class TelnyxProvider(TelephonyProvider):
                 logger.error("Expected 'start' event second")
                 await websocket.close(code=4400, reason="Expected start event")
                 return
+            logger.info(
+                f"[run {workflow_run_id}] Telnyx media socket: 'start' after "
+                f"{_ms_since(accepted)} ms"
+                + (" (restarted stream)" if second_socket else "")
+            )
 
             # media_format.encoding is the codec Telnyx delivers on the
             # inbound direction (Telnyx → Dograh); the outbound direction is
@@ -425,6 +454,20 @@ class TelnyxProvider(TelephonyProvider):
                 },
             )
 
+        except _NoStreamStart:
+            if second_socket:
+                await self._give_up_on_stream(
+                    websocket, workflow_run_id, call_control_id_hint, received
+                )
+            else:
+                await self._restart_stream(
+                    websocket,
+                    workflow_id,
+                    organization_id,
+                    workflow_run_id,
+                    call_control_id_hint,
+                    received,
+                )
         except WebSocketDisconnect as e:
             # Telnyx opens the WebSocket during `bridging` (pre-answer) but only
             # sends the `start` event on `call.answered`. If the call ends before
@@ -437,6 +480,148 @@ class TelnyxProvider(TelephonyProvider):
         except Exception as e:
             logger.error(f"Error in Telnyx WebSocket handler: {e}")
             raise
+
+    async def _answered_inbound_call(
+        self, workflow_run_id: int, organization_id: int
+    ) -> str | None:
+        """The call_control_id of an inbound call, or None.
+
+        An inbound Telnyx call is answered before its socket is opened
+        (``answer_and_stream``), so its "start" is due at once. An outbound
+        call's socket opens while the far end still rings and "start" follows
+        the answer, however long that takes: it is never timed.
+        """
+        try:
+            workflow_run = await db_client.get_workflow_run(
+                workflow_run_id, organization_id=organization_id
+            )
+        except Exception as e:  # noqa: BLE001 - never time a call we cannot read
+            logger.warning(f"[run {workflow_run_id}] Could not read the run: {e}")
+            return None
+        if workflow_run is None:
+            return None
+        initial_context = workflow_run.initial_context or {}
+        if initial_context.get("direction") != "inbound":
+            return None
+        call_id = (workflow_run.gathered_context or {}).get("call_id")
+        return call_id if isinstance(call_id, str) and call_id else None
+
+    @staticmethod
+    async def _receive_before(websocket: "WebSocket", deadline: float | None) -> str:
+        if deadline is None:
+            return await websocket.receive_text()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _NoStreamStart()
+        try:
+            return await asyncio.wait_for(websocket.receive_text(), remaining)
+        except asyncio.TimeoutError:
+            raise _NoStreamStart() from None
+
+    async def _restart_stream(
+        self,
+        websocket: "WebSocket",
+        workflow_id: int,
+        organization_id: int,
+        workflow_run_id: int,
+        call_control_id: str,
+        received: list[str],
+    ) -> None:
+        """Ask Telnyx to stream this call again, to a socket of its own.
+
+        This socket is given up on before anything is asked of Telnyx, and its
+        handler returns without reading again: a "start" that does arrive on
+        it now is never read, so only the new socket can run a pipeline.
+        """
+        logger.warning(
+            f"[run {workflow_run_id}] Telnyx sent no 'start' within "
+            f"{stream_recovery.START_TIMEOUT_SECS:g} s of the media socket opening "
+            f"(received: {', '.join(received) or 'nothing'}); restarting the stream "
+            f"for call {call_control_id}"
+        )
+        await _close_quietly(websocket, 1000, "Restarting the media stream")
+        _, wss_backend_endpoint = await get_backend_endpoints()
+        stream_url = ws_auth.build_media_ws_url(
+            wss_backend_endpoint, workflow_id, organization_id, workflow_run_id
+        )
+        if not await stream_recovery.allow_second_socket(
+            workflow_run_id
+        ) or not await self.restart_streaming(call_control_id, stream_url):
+            await self._give_up_on_stream(
+                None, workflow_run_id, call_control_id, received, restarted=False
+            )
+
+    async def _give_up_on_stream(
+        self,
+        websocket: "WebSocket | None",
+        workflow_run_id: int,
+        call_control_id: str,
+        received: list[str],
+        *,
+        restarted: bool = True,
+    ) -> None:
+        """Hang up rather than leave the caller in silence, and fail the run."""
+        reason = (
+            "Telnyx did not start the call's media stream, and did not start it "
+            "when asked again"
+            if restarted
+            else "Telnyx did not start the call's media stream, and it could not "
+            "be restarted"
+        )
+        logger.warning(
+            f"[run {workflow_run_id}] {reason} (received: "
+            f"{', '.join(received) or 'nothing'}); hanging up call {call_control_id}"
+        )
+        if websocket is not None:
+            await _close_quietly(websocket, 1000, "No media stream")
+        await self.hangup_call(call_control_id)
+        from api.services.workflow_run_failure import mark_workflow_run_failed
+
+        await mark_workflow_run_failed(workflow_run_id, reason)
+
+    async def restart_streaming(self, call_control_id: str, stream_url: str) -> bool:
+        """Stop the call's media stream and start it again to ``stream_url``.
+
+        https://developers.telnyx.com/api-reference/call-commands/stop-streaming
+        https://developers.telnyx.com/api-reference/call-commands/start-streaming
+        The start carries the stream settings ``answer_and_stream`` answers
+        with. A failed stop is only logged: there may be no stream to stop.
+        """
+        base = f"{self.TELNYX_API_BASE}/calls/{call_control_id}/actions"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base}/streaming_stop", json={}, headers=self._headers()
+            ) as response:
+                if response.status != 200:
+                    logger.warning(
+                        f"Telnyx streaming_stop for {call_control_id}: "
+                        f"status={response.status}, response={await response.text()}"
+                    )
+            async with session.post(
+                f"{base}/streaming_start",
+                json={
+                    "stream_url": stream_url,
+                    "stream_track": "inbound_track",
+                    "stream_bidirectional_mode": "rtp",
+                    "stream_bidirectional_codec": "PCMU",
+                },
+                headers=self._headers(),
+            ) as response:
+                if response.status != 200:
+                    logger.error(
+                        f"Telnyx streaming_start for {call_control_id} failed: "
+                        f"status={response.status}, response={await response.text()}"
+                    )
+                    return False
+        logger.info(f"Restarted Telnyx media stream for call {call_control_id}")
+        return True
+
+    async def hangup_call(self, call_control_id: str) -> bool:
+        from .strategies import TelnyxHangupStrategy
+
+        return await TelnyxHangupStrategy().execute_hangup(
+            {"call_control_id": call_control_id, "api_key": self.api_key}
+        )
 
     async def answer_and_stream(
         self, call_control_id: str, stream_url: str, webhook_url: str
@@ -902,3 +1087,18 @@ class TelnyxProvider(TelephonyProvider):
         except Exception as e:
             logger.error(f"Exception during Telnyx create_conference: {e}")
             return None
+
+
+class _NoStreamStart(Exception):
+    """The media socket brought no "start" in time."""
+
+
+def _ms_since(started: float) -> int:
+    return round((time.monotonic() - started) * 1000)
+
+
+async def _close_quietly(websocket: "WebSocket", code: int, reason: str) -> None:
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:  # noqa: BLE001 - Telnyx may already have closed it
+        pass

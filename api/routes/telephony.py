@@ -50,6 +50,7 @@ from api.services.telephony.transfer_event_protocol import (
 )
 from api.services.workflow.run_creation import prepare_workflow_run_inputs
 from api.services.workflow_run_failure import mark_workflow_run_failed
+from api.services.telephony.providers.telnyx import stream_recovery
 from api.utils.common import get_backend_endpoints
 from api.utils.telephony_helper import (
     generic_hangup_response,
@@ -645,6 +646,7 @@ async def websocket_endpoint(
     the shared handler rejects it 4401 like any other unauthenticated peer.
     """
     await websocket.accept()
+    stream_recovery.note_accepted(websocket)
     await _handle_telephony_websocket(
         websocket, workflow_id, organization_id, workflow_run_id, token=token
     )
@@ -726,15 +728,30 @@ async def _handle_telephony_websocket(
             await websocket.close(code=4400, reason="workflow_run_workflow_mismatch")
             return
 
-        # Check workflow run state - only allow 'initialized' state
+        # Check workflow run state - only allow 'initialized' state, and the
+        # one second socket a Telnyx run may be allowed when its first never
+        # started (Harkbell T-679, providers/telnyx/stream_recovery.py).
+        second_socket = False
         if workflow_run.state != WorkflowRunState.INITIALIZED.value:
-            logger.warning(
-                f"Workflow run {workflow_run_id} not in initialized state: {workflow_run.state}"
-            )
-            await websocket.close(
-                code=4409, reason="Workflow run not available for connection"
-            )
-            return
+            if (
+                workflow_run.state == WorkflowRunState.RUNNING.value
+                and (workflow_run.initial_context or {}).get("provider")
+                == WorkflowRunMode.TELNYX.value
+                and await stream_recovery.take_second_socket(workflow_run_id)
+            ):
+                second_socket = True
+                stream_recovery.mark_second_socket(websocket)
+                logger.info(
+                    f"[run {workflow_run_id}] Accepting the restarted media stream's socket"
+                )
+            else:
+                logger.warning(
+                    f"Workflow run {workflow_run_id} not in initialized state: {workflow_run.state}"
+                )
+                await websocket.close(
+                    code=4409, reason="Workflow run not available for connection"
+                )
+                return
 
         # Extract provider type from workflow run context
         provider_type = None
@@ -796,13 +813,14 @@ async def _handle_telephony_websocket(
             return
 
         # Set workflow run state to 'running' before starting the pipeline
-        await db_client.update_workflow_run(
-            run_id=workflow_run_id, state=WorkflowRunState.RUNNING.value
-        )
+        if not second_socket:
+            await db_client.update_workflow_run(
+                run_id=workflow_run_id, state=WorkflowRunState.RUNNING.value
+            )
 
-        logger.info(
-            f"[run {workflow_run_id}] Set workflow run state to 'running' for {provider_type} provider"
-        )
+            logger.info(
+                f"[run {workflow_run_id}] Set workflow run state to 'running' for {provider_type} provider"
+            )
 
         # Delegate to provider-specific handler
         await provider.handle_websocket(
