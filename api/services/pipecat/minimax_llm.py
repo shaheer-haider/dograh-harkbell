@@ -89,9 +89,17 @@ from api.services.pipecat.greeting_repeats import (
     caller_has_spoken,
     greeting_from_context,
 )
+from api.services.pipecat.reasks import (
+    COULD_NOT_UNDERSTAND,
+    THRESHOLD as REASK_THRESHOLD,
+    ReAskGuard,
+    hands_off_itself,
+    reask_count,
+)
 from api.services.pipecat.spoken_reasoning import SpokenReasoningFilter
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.minimax.llm import MiniMaxLLMService
+from pipecat.utils.run_context import run_id_var
 
 # T-667: how long a response may say nothing before it is asked again, how
 # many times, and how long a started stream may go quiet. Module constants so a
@@ -344,10 +352,22 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
             repeats = GreetingRepeatGuard(greeting) if greeting else None
         else:
             opening = self._greeting is None
+        # Three re-asks in a row hand the call on (reasks.py): on a step that
+        # offers could_not_understand, the run so far is read off the
+        # conversation, and this reply is held if it would be the third.
+        reasks = None
+        offered = _offered_tool_names(context)
+        if (
+            offered is not None
+            and COULD_NOT_UNDERSTAND in offered
+            and self.has_function(COULD_NOT_UNDERSTAND)
+        ):
+            reasks = ReAskGuard(reask_count(getattr(context, "messages", None)))
         return self._drop_spoken_reasoning(
             self._drop_tool_markup(self._unstalled(context), context),
             repeats=repeats,
             opening=opening,
+            reasks=reasks,
         )
 
     async def _drop_spoken_reasoning(
@@ -356,6 +376,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         *,
         repeats: GreetingRepeatGuard | None = None,
         opening: bool = False,
+        reasks: ReAskGuard | None = None,
     ) -> AsyncIterator[ChatCompletionChunk]:
         """The reply without the model's own reasoning in it (``spoken_reasoning.py``).
 
@@ -364,11 +385,18 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         agent's turn in the context. Structured tool calls pass untouched: a
         reply that was all reasoning says nothing, and its calls still run.
         """
-        reasoning = SpokenReasoningFilter(repeats=repeats)
+        reasoning = SpokenReasoningFilter(repeats=repeats, reasks=reasks)
+        tool_names: set[str] = set()
+        next_index = 0
         try:
             async for chunk in stream:
                 if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta:
                     delta = chunk.choices[0].delta
+                    for call in delta.tool_calls or []:
+                        next_index = max(next_index, (getattr(call, "index", 0) or 0) + 1)
+                        name = getattr(getattr(call, "function", None), "name", None)
+                        if isinstance(name, str) and name:
+                            tool_names.add(name)
                     if delta.content:
                         delta.content = reasoning.feed(delta.content) or None
                 yield chunk
@@ -377,10 +405,41 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
                 yield _content_chunk(rest)
             if opening and reasoning.said.strip():
                 self._greeting = reasoning.said.strip()
+            if reasks is not None:
+                for chunk in self._settle_reask(reasks, tool_names, next_index):
+                    yield chunk
         finally:
             close = getattr(stream, "aclose", None)
             if close is not None:
                 await close()
+
+    def _settle_reask(
+        self, reasks: ReAskGuard, tool_names: set[str], next_index: int
+    ) -> list[ChatCompletionChunk]:
+        """What a reply that was a re-ask ends with: as it was, or the hand-off."""
+        run = run_id_var.get()
+        if not reasks.holding:
+            if reasks.is_reask:
+                logger.info(
+                    f"[run {run}] re-ask {reasks.number} of {REASK_THRESHOLD}: "
+                    f"{reasks.spoken.strip()!r}"
+                )
+            return []
+        held = "".join(reasks.held)
+        if hands_off_itself(tool_names):
+            # The model hands the call on by itself: its reply stands.
+            logger.info(
+                f"[run {run}] re-ask {reasks.number} of {REASK_THRESHOLD} comes with "
+                f"the model's own hand-off; leaving it"
+            )
+            return [_content_chunk(held)] if held else []
+        arguments = reasks.hand_off_arguments()
+        logger.info(
+            f"[run {run}] re-ask {reasks.number} of {REASK_THRESHOLD}: handing the "
+            f"call on through {COULD_NOT_UNDERSTAND}({arguments}) instead of saying "
+            f"{reasks.spoken.strip()!r}"
+        )
+        return [_tool_call_chunk(next_index, COULD_NOT_UNDERSTAND, arguments)]
 
     async def _unstalled(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
         """The response stream, asked again when it says nothing and ended when it goes quiet."""

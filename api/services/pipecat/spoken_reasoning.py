@@ -37,6 +37,7 @@ from loguru import logger
 
 from api.services.pipecat.cut_off import CUT_OFF_MARKER
 from api.services.pipecat.greeting_repeats import GreetingRepeatGuard
+from api.services.pipecat.reasks import ReAskGuard
 
 # A parameter or tool name: lower_snake_case. Not part of an email address or a
 # web address, and not an address being read out ("first_last at gmail").
@@ -89,7 +90,11 @@ def opens_with_self_talk(sentence: str) -> bool:
 class SpokenReasoningFilter:
     """One response's text, sentence by sentence, without the reasoning in it."""
 
-    def __init__(self, repeats: "GreetingRepeatGuard | None" = None):
+    def __init__(
+        self,
+        repeats: "GreetingRepeatGuard | None" = None,
+        reasks: "ReAskGuard | None" = None,
+    ):
         self._buffer = ""
         self._held: list[str] = []
         self._reasoning = False
@@ -97,6 +102,8 @@ class SpokenReasoningFilter:
         # The call's greeting, when this reply must not say it again
         # (greeting_repeats.py).
         self._repeats = repeats
+        # The run of re-asks this reply may be the third of (reasks.py).
+        self._reasks = reasks
         # Everything this reply has handed on to be spoken.
         self.said = ""
 
@@ -170,7 +177,8 @@ class SpokenReasoningFilter:
         kept = "".join(
             piece
             for piece in pieces
-            if self._repeats is None or not piece.strip() or self._repeats.keep(piece)
+            if (self._repeats is None or not piece.strip() or self._repeats.keep(piece))
+            and (self._reasks is None or self._reasks.pass_on(piece))
         )
         self.said += kept
         return kept
