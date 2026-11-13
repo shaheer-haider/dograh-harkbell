@@ -410,3 +410,31 @@ def test_get_counts_only_of_words_the_agent_did_not_catch():
     assert not reask("I can't get you a refund from here.")
     assert not reask("I couldn't get through to the team.")
 
+
+def test_a_check_in_on_a_silent_line_is_not_a_reask():
+    from api.services.pipecat.reasks import is_reask
+
+    assert not is_reask("Hello? Are you still there? I can't hear anything on the line — please call us back.")
+    assert not is_reask("I'm sorry — let me try again. Are you still there?")
+    assert is_reask("Sorry, I can't hear you very well — could you say that again?")
+
+
+def test_a_fragment_the_caller_cut_off_neither_counts_nor_resets():
+    from api.services.pipecat.cut_off import CUT_OFF_MARKER
+    from api.services.pipecat.reasks import reask_count
+
+    # Run 4799: the caller's "No." / "That is still wrong." arrived as two
+    # turns, and the reply between them was cut off after "I'm".
+    messages = [
+        {"role": "user", "content": "No. That is wrong."},
+        {"role": "assistant", "content": "I'm sorry, I think I'm misunderstanding. Could you tell me what you need?"},
+        {"role": "user", "content": "No."},
+        {"role": "assistant", "content": f"I'm — {CUT_OFF_MARKER}"},
+        {"role": "user", "content": "That is still wrong."},
+        {"role": "assistant", "content": "I'm sorry — I'm having trouble understanding. Could you say that again?"},
+        {"role": "user", "content": "No."},
+        {"role": "assistant", "content": f"I'm — {CUT_OFF_MARKER}"},
+        {"role": "user", "content": "That is not it either."},
+    ]
+    assert reask_count(messages).count == 2
+

@@ -76,6 +76,7 @@ REASK_PATTERNS = [
         _I,
     ),
 ]
+_SILENT_LINE = re.compile(r"\bare\s+you\s+still\s+there\b|\bcan'?t\s+hear\s+anything\b|\bcannot\s+hear\s+anything\b", _I)
 _ORDER_NUMBER = re.compile(r"\border\s+(?:number|no\.?)\b", _I)
 _CUT_OFF_SUFFIX = re.compile(rf"\s*—\s*{re.escape(CUT_OFF_MARKER)}\s*$")
 
@@ -85,6 +86,11 @@ def is_reask(text: str) -> bool:
     # The model writes "didn’t" with a curly apostrophe as often as a
     # straight one, and the patterns spell it straight.
     text = _CUT_OFF_SUFFIX.sub("", text or "").replace("\u2019", "'")
+    # A check-in on a silent line is about silence, not about words the agent
+    # could not follow: production run 4799 counted "Hello? Are you still
+    # there? I can't hear anything on the line" as re-ask 1 of 3.
+    if _SILENT_LINE.search(text):
+        return False
     return any(pattern.search(text) for pattern in REASK_PATTERNS)
 
 
@@ -160,8 +166,16 @@ def reask_count(messages) -> ReAskCount:
                 if function.get("name") == "transfer_call":
                     reset()
                     handed_off = True
-            text = _CUT_OFF_SUFFIX.sub("", _text(message)).strip()
+            raw = _text(message)
+            cut_off = bool(_CUT_OFF_SUFFIX.search(raw))
+            text = _CUT_OFF_SUFFIX.sub("", raw).strip()
             if not text:
+                continue
+            if cut_off and not handed_off and not state.awaiting_reply and not is_reask(text):
+                # A reply the caller cut off after a word or two ("I'm") says
+                # nothing about progress: on production run 4799 it reset the
+                # run between the second re-ask and the third, so the third
+                # was counted as the first and the call was never handed on.
                 continue
             if handed_off:
                 # The reply that hands the call on is not a re-ask, whatever
