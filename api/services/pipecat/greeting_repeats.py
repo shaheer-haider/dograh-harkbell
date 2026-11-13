@@ -16,6 +16,14 @@ is dropped -- except a question: "How can I help you?" stays, so the caller
 still gets an answer. A re-greeting with nothing else in it says only the
 greeting's question, and nothing when the greeting asked none.
 
+A reply can also fuse the greeting's first sentence into a sentence of its
+own: run 4810 (``-harkbell.20``) answered a second "Hello?" with "Hi, this is
+Emma at Mirror Labs — how can I help you?", one sentence and a question, so
+it was kept whole and the caller heard the greeting's first sentence twice.
+A sentence that opens with the greeting's first sentence as a clause loses
+that clause and keeps the rest ("How can I help you?"), and counts as a
+re-greeting like the sentence said on its own.
+
 It is that narrow on purpose. Nothing but the greeting's own sentences is
 ever dropped (a caller may ask for an email address or a read-back twice and
 must hear it twice), and a greeting sentence repeated on its own -- "Thanks
@@ -31,6 +39,8 @@ from api.services.pipecat.phrase_turn_start import normalize_transcript
 
 _SENTENCE = re.compile(r".+?(?:[.!?…]+[\"'”’)\]]*(?=\s|$)|$)", re.DOTALL)
 _DASHES = re.compile(r"[—–]")
+# What is left in front of a sentence once a fused opening clause is cut off.
+_CLAUSE_JOIN = re.compile(r"^[\s,;:.!—–-]+")
 _CUT_OFF_SUFFIX = re.compile(rf"\s*—\s*{re.escape(CUT_OFF_MARKER)}\s*$")
 
 
@@ -82,6 +92,32 @@ class GreetingRepeatGuard:
         self._questions = [s for s in sentences if is_question(s)]
         self.regreeting = False
         self.dropped: list[str] = []
+
+    def say(self, sentence: str) -> str:
+        """What of a sentence of the reply may be said: all of it, the rest of
+        it after a fused opening clause, or nothing."""
+        if not sentence.strip():
+            return sentence
+        rest = self._after_fused_opening(sentence)
+        if rest is not None:
+            self.regreeting = True
+            self.dropped.append(sentence[: len(sentence) - len(rest)].strip())
+            sentence = rest
+        return sentence if self.keep(sentence) else ""
+
+    def _after_fused_opening(self, sentence: str) -> str | None:
+        """The sentence after the greeting's first sentence, when it opens with
+        it as a clause of a longer sentence; None otherwise."""
+        key = sentence_key(sentence)
+        if not self._opening or not key.startswith(self._opening + " "):
+            return None
+        for end in range(1, len(sentence)):
+            if not sentence[end].isalnum() and sentence_key(sentence[:end]) == self._opening:
+                rest = _CLAUSE_JOIN.sub("", sentence[end:])
+                if not rest.strip():
+                    return None
+                return rest[0].upper() + rest[1:]
+        return None
 
     def keep(self, sentence: str) -> bool:
         """Whether a sentence of the reply may be said."""

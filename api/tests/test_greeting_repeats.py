@@ -143,3 +143,34 @@ async def test_a_text_chat_turn_reads_the_greeting_from_the_context():
 async def test_without_a_greeting_nothing_is_dropped():
     context = LLMContext(messages=[{"role": "user", "content": "Hi there"}])
     assert await _reply(_service(), context, REPLY_4603) == REPLY_4603
+
+
+# Run 4810 (-harkbell.20): the reply to a second "Hello?" fused the greeting's
+# first sentence into a question.
+FUSED_4810 = "Hi, this is Emma at Mirror Labs — how can I help you?"
+
+
+@pytest.mark.parametrize("step", [1, 5, 1000])
+def test_run_4810s_fused_greeting_says_only_the_rest(step):
+    assert say(FUSED_4810, GREETING, step) == "How can I help you?"
+
+
+def test_a_fused_opening_clause_is_cut_however_it_is_joined():
+    assert say("Hi, this is Emma at Mirror Labs, and what's the order number?", GREETING) == (
+        "And what's the order number?"
+    )
+    assert say("hi this is emma at mirror labs: sorry, the line dropped.", GREETING) == (
+        "Sorry, the line dropped."
+    )
+    # It is a re-greeting: the greeting's other sentences after it go too.
+    assert say(f"{FUSED_4810} Thanks for calling.", GREETING).strip() == "How can I help you?"
+
+
+def test_a_sentence_that_only_starts_like_the_greeting_is_kept():
+    # "Hi, this is Emma" is not the greeting's whole first sentence.
+    assert say("Hi, this is Emma again — how can I help?", GREETING) == (
+        "Hi, this is Emma again — how can I help?"
+    )
+    # Nor is a sentence that names the business further in.
+    line = "You've reached Hi, this is Emma at Mirror Labs support?"
+    assert say(line, GREETING) == line

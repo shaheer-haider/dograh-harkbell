@@ -196,11 +196,14 @@ class SpokenReasoningFilter:
 
     def _release(self, pieces: list[str]) -> str:
         """Hand sentences on to be spoken, less any repeat of the greeting."""
-        kept = "".join(
-            piece
-            for piece in pieces
-            if (self._repeats is None or not piece.strip() or self._repeats.keep(piece))
-            and (self._reasks is None or self._reasks.pass_on(piece))
-        )
+        kept = []
+        for piece in pieces:
+            if self._repeats is not None:
+                piece = self._repeats.say(piece)
+                if not piece:
+                    continue
+            if self._reasks is None or self._reasks.pass_on(piece):
+                kept.append(piece)
+        kept = "".join(kept)
         self.said += kept
         return kept
