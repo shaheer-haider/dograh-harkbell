@@ -224,6 +224,9 @@ def build_realtime_pipeline(
     processors = [
         transport.input(),
         termination_funnel,
+        # Harkbell: a keypress is not audio the model hears. It becomes a
+        # "[keypad] <digits>" turn here too (``bind_realtime_keypad``).
+        KeypadAggregator(),
         user_context_aggregator,
         call_monitor_processor,
         realtime_llm,

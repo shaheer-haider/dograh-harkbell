@@ -43,7 +43,7 @@ from api.services.pipecat.event_handlers import (
     register_event_handlers,
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
-from api.services.pipecat.keypad import with_keypad_turns
+from api.services.pipecat.keypad import bind_realtime_keypad, with_keypad_turns
 from api.services.pipecat.phrase_turn_start import (
     create_turn_start_strategy,
     resolve_turn_start_phrases,
@@ -1001,6 +1001,9 @@ async def _run_pipeline_impl(
         user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(
             user_config.realtime.provider, user_config.realtime.model
         )
+        # A keypress is a complete turn of its own here too: it interrupts
+        # what is playing and is answered (``bind_realtime_keypad`` below).
+        user_turn_strategies = with_keypad_turns(user_turn_strategies)
     else:
         # Provider turn endings stay authoritative even when a word threshold
         # controls when the caller can interrupt.
@@ -1060,6 +1063,7 @@ async def _run_pipeline_impl(
             ),
         )
         user_context_aggregator, assistant_context_aggregator = context_aggregator
+        bind_realtime_keypad(user_context_aggregator)
     else:
         # The assistant half keeps what played of a reply the caller cut off,
         # marked as cut off, so "hello?" over a greeting is not greeted again

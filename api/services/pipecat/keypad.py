@@ -25,6 +25,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     Frame,
     InputDTMFFrame,
+    LLMMessagesAppendFrame,
     TranscriptionFrame,
     UserMuteStartedFrame,
     UserMuteStoppedFrame,
@@ -123,8 +124,12 @@ class KeypadUserTurnStartStrategy(BaseUserTurnStartStrategy):
     strategy would otherwise reset the aggregation that holds it.
     """
 
+    # The entry that started the turn, for ``bind_realtime_keypad``.
+    last_entry: str | None = None
+
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         if is_keypad_transcript(frame):
+            self.last_entry = frame.text
             await self.trigger_user_turn_started()
             return ProcessFrameResult.STOP
         return ProcessFrameResult.CONTINUE
@@ -159,3 +164,35 @@ def keypad_start_strategies(strategies: UserTurnStrategies | None) -> list:
     return [
         s for s in strategies.start or [] if isinstance(s, KeypadUserTurnStartStrategy)
     ]
+
+
+def bind_realtime_keypad(user_aggregator) -> None:
+    """Hand a keypad entry to a realtime model as a user turn it answers.
+
+    Harkbell. A speech-to-speech model hears the caller's audio itself, and a
+    keypress is not audio it is given: the telephony serializer takes the tone
+    out and sends an ``InputDTMFFrame`` instead. In a cascade call the keypad
+    transcript ends a user turn and the aggregator sends the context to the
+    model. In realtime mode the aggregator sends nothing at a turn's end -- the
+    provider answers its own audio -- so the press was recorded and never
+    answered: a caller who pressed 1 for urgent help heard nothing change.
+
+    The entry is sent the way the idle check is: a one-off user message with a
+    request to answer it. From the turn-started event, because by then the
+    aggregator has broadcast the interruption the keypad turn causes, and a
+    frame pushed after it reaches the service after it -- the other order would
+    cancel the answer to the key.
+    """
+
+    async def answer_keypad_entry(aggregator, strategy) -> None:
+        if not isinstance(strategy, KeypadUserTurnStartStrategy):
+            return
+        entry, strategy.last_entry = strategy.last_entry, None
+        if not entry:
+            return
+        logger.info(f"Keypad entry sent to the realtime model: {entry!r}")
+        await aggregator.push_frame(
+            LLMMessagesAppendFrame([{"role": "user", "content": entry}], run_llm=True)
+        )
+
+    user_aggregator.add_event_handler("on_user_turn_started", answer_keypad_entry)

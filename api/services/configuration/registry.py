@@ -933,6 +933,63 @@ class OpenAIRealtimeLLMConfiguration(BaseLLMConfiguration):
         },
     )
 
+    # Harkbell: session tuning for a phone line. Each is left unset by default,
+    # which sends nothing and keeps the provider's own default.
+    reasoning_effort: str | None = Field(
+        default=None,
+        description=(
+            "How much the model reasons before it answers (minimal, low, medium, "
+            "high). Lower answers sooner. Leave unset for the provider's default."
+        ),
+        json_schema_extra={
+            "examples": ["minimal", "low", "medium", "high"],
+            "allow_custom_input": True,
+            "hidden_for_models": ["gpt-live-1"],
+        },
+    )
+    turn_detection: Literal["server_vad", "semantic_vad"] | None = Field(
+        default=None,
+        description=(
+            "How the end of the caller's turn is found: server_vad waits for "
+            "silence, semantic_vad for a finished thought."
+        ),
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+    vad_eagerness: Literal["low", "medium", "high", "auto"] | None = Field(
+        default=None,
+        description="semantic_vad only: how soon a turn is taken as finished.",
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+    vad_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="server_vad only: how loud counts as speech (0 to 1).",
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+    vad_silence_ms: int | None = Field(
+        default=None,
+        ge=100,
+        le=5000,
+        description="server_vad only: silence that ends the caller's turn, in ms.",
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+    noise_reduction: Literal["near_field", "far_field"] | None = Field(
+        default=None,
+        description=(
+            "Clean the caller's audio before the model hears it: near_field for "
+            "a handset or headset, far_field for a speakerphone."
+        ),
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+    speed: float | None = Field(
+        default=None,
+        ge=0.25,
+        le=1.5,
+        description="How fast the voice speaks (1.0 is the model's own pace).",
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+
     @model_validator(mode="before")
     @classmethod
     def default_live_voice(cls, data):

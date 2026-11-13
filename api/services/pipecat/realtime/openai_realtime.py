@@ -64,6 +64,9 @@ class DograhOpenAIRealtimeLLMService(
         # the text-greeting slot because the transcript may be None while the
         # open itself is still pending.
         self._pending_prerecorded_greeting: tuple[str | None] | None = None
+        # A one-off prompt that arrived while a reply was still being made:
+        # that reply is cancelled, and the prompt is answered once it has ended.
+        self._run_llm_after_response_done = False
 
     # ------------------------------------------------------------------
     # Provider frames: ephemeral prompts and tool-call deferral
@@ -100,7 +103,15 @@ class DograhOpenAIRealtimeLLMService(
             appended_any = True
 
         if frame.run_llm and appended_any:
-            await self._send_manual_response_create()
+            if self._current_assistant_response is not None:
+                # Harkbell: a keypress over a reply the model is still making.
+                # The provider only cancels a reply for speech it hears, and a
+                # second response on top of a live one is refused, so cancel
+                # this one and answer the prompt when it has ended.
+                self._run_llm_after_response_done = True
+                await self.send_client_event(events.ResponseCancelEvent())
+            else:
+                await self._send_manual_response_create()
 
     async def _handle_context(self, context: LLMContext):
         if not self._handled_initial_context:
@@ -323,6 +334,9 @@ class DograhOpenAIRealtimeLLMService(
 
     async def _handle_evt_response_done(self, evt):
         await super()._handle_evt_response_done(evt)
+        if self._run_llm_after_response_done:
+            self._run_llm_after_response_done = False
+            await self._send_manual_response_create()
         await self._workflow_tool_deferral.complete_response(
             evt.response.id,
             speaking=self._workflow_bot_is_speaking,

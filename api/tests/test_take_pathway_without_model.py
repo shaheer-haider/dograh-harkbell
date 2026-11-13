@@ -208,10 +208,16 @@ def test_a_flag_the_graph_cannot_honour_falls_back_to_the_model():
     assert not engine._pathway_without_model(
         "harkbell-start", None, opening_context=None, wait_for_playback=False
     )
+
+
+def test_a_realtime_call_takes_the_pathway_without_the_model_too():
+    # -harkbell.24: the model opened the screening line in words of its own
+    # (copy run 4859), so the engine opens a realtime call as it opens any other.
     realtime = _engine(screening_graph(), is_realtime=True)
-    assert not realtime._pathway_without_model(
+    edge = realtime._pathway_without_model(
         "harkbell-start", None, opening_context=None, wait_for_playback=False
     )
+    assert edge is not None and edge.target == "harkbell-main"
 
 
 # ── a call ────────────────────────────────────────────────────────────────

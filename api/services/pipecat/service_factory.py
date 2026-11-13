@@ -1434,8 +1434,12 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
             AudioConfiguration,
             AudioInput,
             AudioOutput,
+            InputAudioNoiseReduction,
             InputAudioTranscription,
+            Reasoning,
+            SemanticTurnDetection,
             SessionProperties,
+            TurnDetection,
         )
 
         # Pin the transcription language when configured. Without it the model
@@ -1444,6 +1448,46 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
         transcription_kwargs = {}
         if language:
             transcription_kwargs["language"] = language
+
+        # Harkbell: the session tuning the configuration may carry. Whatever
+        # is unset is not sent, so the provider's default stands.
+        input_kwargs = {}
+        turn_detection = getattr(realtime_config, "turn_detection", None)
+        vad_threshold = getattr(realtime_config, "vad_threshold", None)
+        vad_silence_ms = getattr(realtime_config, "vad_silence_ms", None)
+        if turn_detection == "semantic_vad":
+            input_kwargs["turn_detection"] = SemanticTurnDetection(
+                eagerness=getattr(realtime_config, "vad_eagerness", None)
+            )
+        elif (
+            turn_detection == "server_vad"
+            or vad_threshold is not None
+            or vad_silence_ms is not None
+        ):
+            defaults = TurnDetection()
+            input_kwargs["turn_detection"] = TurnDetection(
+                threshold=(
+                    vad_threshold if vad_threshold is not None else defaults.threshold
+                ),
+                silence_duration_ms=(
+                    vad_silence_ms
+                    if vad_silence_ms is not None
+                    else defaults.silence_duration_ms
+                ),
+            )
+        noise_reduction = getattr(realtime_config, "noise_reduction", None)
+        if noise_reduction:
+            input_kwargs["noise_reduction"] = InputAudioNoiseReduction(
+                type=noise_reduction
+            )
+        output_kwargs = {}
+        speed = getattr(realtime_config, "speed", None)
+        if speed is not None:
+            output_kwargs["speed"] = speed
+        session_kwargs = {}
+        reasoning_effort = getattr(realtime_config, "reasoning_effort", None)
+        if reasoning_effort:
+            session_kwargs["reasoning"] = Reasoning(effort=reasoning_effort)
 
         return DograhOpenAIRealtimeLLMService(
             api_key=api_key,
@@ -1455,11 +1499,14 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
                             transcription=InputAudioTranscription(
                                 **transcription_kwargs
                             ),
+                            **input_kwargs,
                         ),
                         output=AudioOutput(
                             voice=voice or "alloy",
+                            **output_kwargs,
                         ),
                     ),
+                    **session_kwargs,
                 ),
             ),
         )

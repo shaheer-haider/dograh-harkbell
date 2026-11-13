@@ -1237,10 +1237,16 @@ class PipecatEngine:
         on such a node takes the edge at once instead.
 
         Only a fresh opening of a flagged start node with exactly one edge to
-        a node that is not an end node qualifies. A resumed node, a realtime
-        model, and an answer-supervised (outbound) opening -- which plays a
-        provisional opening against its own context and waits on it -- keep
-        the model, as does anything without the flag.
+        a node that is not an end node qualifies. A resumed node and an
+        answer-supervised (outbound) opening -- which plays a provisional
+        opening against its own context and waits on it -- keep the model, as
+        does anything without the flag.
+
+        A realtime model qualifies since ``-harkbell.24``. Asked to open the
+        screening line it took the pathway itself, then greeted in words of
+        its own -- no agent name, no keypad line (copy run 4859, gpt-realtime
+        2.1). Taken by the engine, the recorded notice plays at once and the
+        next node's greeting is given to the model to say as written.
         """
         node = self.active_agent.workflow.nodes.get(node_id)
         if (
@@ -1255,8 +1261,6 @@ class PipecatEngine:
             reason = f"it has {len(node.out_edges)} pathways, not one"
         elif self.active_agent.workflow.nodes[node.out_edges[0].target].is_end:
             reason = "its pathway ends the call"
-        elif self._is_realtime:
-            reason = "a realtime model speaks for itself"
         elif opening_context is not None or wait_for_playback:
             reason = "the opening is answer-supervised"
         if reason:
