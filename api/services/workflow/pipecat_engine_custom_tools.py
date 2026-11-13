@@ -638,6 +638,14 @@ class CustomToolManager:
                     properties=properties,
                 )
 
+                # Harkbell: a realtime model keeps listening while the goodbye
+                # plays; from here it hears and says nothing more.
+                close_conversation = getattr(
+                    self._engine.active_agent.llm, "close_conversation", None
+                )
+                if close_conversation is not None:
+                    await close_conversation()
+
                 speech = await self._play_config_message(config)
                 if speech is not None and speech.outcome not in (
                     PlaybackOutcome.FAILED,

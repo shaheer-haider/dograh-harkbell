@@ -295,8 +295,30 @@ class DograhOpenAIRealtimeLLMService(
             )
         )
 
+    async def close_conversation(self) -> None:
+        await super().close_conversation()
+        # A reply the model had already begun -- to the tail of the caller's
+        # goodbye -- is cancelled; "not active" is an error the receive loop
+        # already treats as nothing.
+        if not self._disconnecting and self._api_session_ready:
+            await self.send_client_event(events.ResponseCancelEvent())
+
+    async def _handle_evt_audio_delta(self, evt):
+        if self._conversation_closed:
+            return
+        await super()._handle_evt_audio_delta(evt)
+
+    async def _handle_evt_audio_transcript_delta(self, evt):
+        if self._conversation_closed:
+            return
+        await super()._handle_evt_audio_transcript_delta(evt)
+
     async def _handle_evt_function_call_arguments_done(self, evt):
         """Only a response's sole workflow-control call may wait for playback."""
+        if self._conversation_closed:
+            # The line is closing: a tool the model reaches for now never runs.
+            logger.info(f"{self}: ignoring a tool call after the conversation closed")
+            return
         try:
             args = json.loads(evt.arguments)
 

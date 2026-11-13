@@ -41,6 +41,10 @@ class RealtimeConversationMixin:
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._user_is_muted = False
+        # Harkbell: set once an end-call tool has run. The goodbye is the
+        # tool's, so nothing the model hears or says after it may reach the
+        # caller (``close_conversation``).
+        self._conversation_closed = False
         # The engine assigns _context before the first context frame arrives.
         self._handled_initial_context = False
         self._workflow_tool_deferral = WorkflowToolCallDeferral(self)
@@ -157,6 +161,21 @@ class RealtimeConversationMixin:
         """Seed the spoken greeting, accept caller audio, and stay silent."""
         raise NotImplementedError
 
+    async def close_conversation(self) -> None:
+        """Stop hearing the caller and stop speaking: the call is ending.
+
+        Harkbell. An end-call tool plays the business's goodbye from a
+        recording and then closes the line, and its result is never sent back
+        (``run_llm=False``). But a realtime provider keeps listening while the
+        recording plays, and a caller's "thank you, bye" that turn detection
+        split in two gave the model a second turn: it said "Goodbye." over the
+        recorded one (copy runs 4882, 4884). From here the caller's audio
+        reaches the provider as silence, and providers drop whatever a reply
+        already under way still sends (``_conversation_closed``).
+        """
+        self._conversation_closed = True
+        self._workflow_tool_deferral.discard("conversation_closed", close=True)
+
     async def _send_user_audio(self, frame: InputAudioRawFrame):
         await super()._send_user_audio(await self._prepare_user_audio(frame))
 
@@ -177,12 +196,12 @@ class RealtimeConversationMixin:
         after resampling to remove any previously buffered caller audio. Copy
         frames so recording and other consumers retain the original audio.
         """
-        muted = self._user_is_muted
+        muted = self._user_is_muted or self._conversation_closed
         audio = bytes([silence_byte]) * len(frame.audio) if muted else frame.audio
         target_rate = sample_rate or frame.sample_rate
         if resampler is not None and frame.sample_rate != target_rate:
             audio = await resampler.resample(audio, frame.sample_rate, target_rate)
-        if muted or self._user_is_muted:
+        if muted or self._user_is_muted or self._conversation_closed:
             audio = bytes([silence_byte]) * len(audio)
         if audio is frame.audio and target_rate == frame.sample_rate:
             return frame
