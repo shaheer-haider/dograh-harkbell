@@ -30,6 +30,7 @@ from api.services.configuration.registry import (
     ServiceType,
 )
 from api.services.configuration.temperature import resolve_temperature
+from api.services.pipecat.assemblyai_stt import HarkbellAssemblyAISTTService
 from api.services.pipecat.fallback_llm import FallbackLLMProcessor, FallbackRoute
 from api.services.pipecat.gemini_json_schema_adapter import (
     DograhGeminiJSONSchemaAdapter,
@@ -37,7 +38,7 @@ from api.services.pipecat.gemini_json_schema_adapter import (
 from api.services.pipecat.minimax_llm import HarkbellMiniMaxLLMService
 from api.services.pipecat.tool_markup import tool_markup_filter
 from api.utils.url_security import validate_user_configured_service_url
-from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
+from pipecat.services.assemblyai.stt import AssemblyAISTTSettings
 from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMSettings
 from pipecat.services.azure.llm import AzureLLMService, AzureLLMSettings
 from pipecat.services.azure.stt import AzureSTTService, AzureSTTSettings
@@ -586,7 +587,10 @@ def create_stt_service(
         settings_kwargs = {"model": user_config.stt.model, "language": language}
         if keyterms:
             settings_kwargs["keyterms_prompt"] = keyterms
-        return AssemblyAISTTService(
+        # Harkbell's subclass: Pipecat's ends the pipeline with a reason-less
+        # EndFrame when its own Terminate is acknowledged, which hung up every
+        # transferred caller (assemblyai_stt.py).
+        return HarkbellAssemblyAISTTService(
             api_key=user_config.stt.api_key,
             settings=AssemblyAISTTSettings(**settings_kwargs),
             sample_rate=audio_config.transport_in_sample_rate,
