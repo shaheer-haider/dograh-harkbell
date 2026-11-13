@@ -395,3 +395,18 @@ async def test_a_text_chat_turn_counts_from_its_checkpoint():
     assert calls == [
         ("could_not_understand", {"about": "what_they_need", "times": 3, "heard": "No. That is wrong."})
     ]
+
+
+def test_get_counts_only_of_words_the_agent_did_not_catch():
+    from api.services.pipecat.reasks import REASK_PATTERNS
+
+    def reask(text: str) -> bool:
+        return any(p.search(text) for p in REASK_PATTERNS)
+
+    assert reask("Sorry, I didn't get your name.")
+    assert reask("I still didn't get that.")
+    # The out-of-hours sentence and a plain refusal are answers, not re-asks.
+    assert not reask("I'm sorry, I can't get anyone from the team on the line right now.")
+    assert not reask("I can't get you a refund from here.")
+    assert not reask("I couldn't get through to the team.")
+

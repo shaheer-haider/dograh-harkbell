@@ -50,7 +50,11 @@ REASK_PATTERNS = [
     # "I didn't catch that", "I still didn't get your name"
     re.compile(
         r"\bI\s+(?:still\s+|just\s+|really\s+)?(?:didn'?t|did\s+not|couldn'?t|could\s+not|can'?t|cannot)\s+"
-        r"(?:quite\s+)?(?:catch|get|hear|make\s+out|understand)\b",
+        # "get" only of words: "I can't get anyone from the team on the line
+        # right now" is the line's own out-of-hours sentence, and "I can't get
+        # you a refund" a plain answer; neither asks the caller to repeat.
+        r"(?:quite\s+)?(?:catch|hear|make\s+out|understand|"
+        r"get(?!\s+(?:you\b|anyone|someone|somebody|them\b|hold|through|into|to\b|a\b|an\b)))\b",
         _I,
     ),
     # "could you say the order number again", "can you repeat that"
