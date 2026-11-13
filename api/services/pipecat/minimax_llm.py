@@ -107,6 +107,13 @@ from pipecat.utils.run_context import run_id_var
 FIRST_OUTPUT_SECS = 8.0
 STALL_RETRIES = 2
 IDLE_SECS = 8.0
+# The longest one reply may stream. A normal reply streams for a few seconds;
+# run 4817 (``-harkbell.21``) streamed for over a minute and said nothing,
+# because every chunk reset the quiet clock while the filters held all of it
+# (spoken_reasoning.MAX_HELD_CHARS). Past this, the reply ends with what it said.
+RESPONSE_MAX_SECS = 30.0
+# The most dropped markup kept to look for a written call in.
+MAX_DROPPED_CHARS = 8000
 # Any request from this service's client: 20 s with nothing read, 5 s to connect.
 REQUEST_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
@@ -279,7 +286,11 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
     async def _filter_tool_markup(self, text: str) -> str | None:
         """One chunk of visible content, with any written tool call taken out."""
         if self._markup_state == _MarkupState.DROP:
-            self._dropped_text += text
+            # Enough for any call written as text; a runaway reply in markup
+            # is read with JSON decoding at its end (MAX_HELD_CHARS in
+            # spoken_reasoning.py for why a reply's size has to be bounded).
+            if len(self._dropped_text) < MAX_DROPPED_CHARS:
+                self._dropped_text += text
             return None
         if self._markup_state == _MarkupState.PASS:
             return self._pass_through(text)
@@ -457,25 +468,37 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
                 continue
             chunks = stream.__aiter__()
             said_something = False
+            overran = False
             try:
                 while True:
+                    left = RESPONSE_MAX_SECS - (loop.time() - started)
+                    if left <= 0:
+                        overran = True
+                        break
                     if said_something:
                         wait = IDLE_SECS
                     elif bounded:
                         wait = max(0.0, FIRST_OUTPUT_SECS - (loop.time() - started))
                     else:
                         wait = None
+                    wait = left if wait is None else min(wait, left)
                     try:
-                        chunk = await (chunks.__anext__() if wait is None else asyncio.wait_for(chunks.__anext__(), wait))
+                        chunk = await asyncio.wait_for(chunks.__anext__(), wait)
                     except StopAsyncIteration:
                         return
                     except (TimeoutError, asyncio.TimeoutError):
+                        overran = loop.time() - started >= RESPONSE_MAX_SECS
                         break
                     if _has_output(chunk):
                         said_something = True
                     yield chunk
             finally:
                 await _close_stream(stream)
+            if overran:
+                logger.warning(
+                    f"MiniMax's reply streamed for {RESPONSE_MAX_SECS:g}s; ending the reply there"
+                )
+                return
             if said_something:
                 logger.warning(f"MiniMax's stream went quiet for {IDLE_SECS}s mid-reply; ending the reply there")
                 return

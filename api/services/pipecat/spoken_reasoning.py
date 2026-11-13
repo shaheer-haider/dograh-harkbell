@@ -63,10 +63,27 @@ _SELF_TALK_OPENER = re.compile(
 )
 # A sentence ends at terminal punctuation followed by a space, before a line
 # break, or at a line break. A blank line ends a paragraph.
+#
+# A match may only start at the first mark of a run, and takes the run without
+# giving any of it back: written as ``[.!?…]+`` it tried every position inside
+# a run and backtracked over the rest from each, so a run of 20,000 marks with
+# no space after it -- a degenerate reply -- held one search for over four
+# seconds, on the event loop, and every chunk of the reply searched it again
+# (production, ``-harkbell.21``, run 4817: see MAX_HELD_CHARS).
 _SENTENCE_END = re.compile(
-    r"[.!?…]+[\"'”’)\]]*(?:[ \t]+|(?=\n))|\n"
+    r"(?<![.!?…])[.!?…]++[\"'”’)\]]*+(?:[ \t]+|(?=\n))|\n"
 )
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
+# The most text held while waiting for a sentence to end. Every chunk searches
+# what is held, so a reply that never ends a sentence -- a degenerate MiniMax
+# stream of marks or identifiers -- made each chunk dearer than the last, said
+# nothing at all, and never tripped the stall guard because chunks kept
+# coming. Production run 4817 (``-harkbell.21``, 2026-11-13): the reply to the
+# first silence prompt said nothing for 64 s, and the engine process stopped
+# answering anything soon after -- ECS killed it five minutes later. Past this
+# many characters the held text is let through as a sentence of its own,
+# which no spoken sentence comes near.
+MAX_HELD_CHARS = 600
 
 
 def is_reasoning(sentence: str) -> bool:
@@ -120,6 +137,11 @@ class SpokenReasoningFilter:
                 self._buffer = self._buffer[paragraph.end() :]
                 continue
             if sentence is None:
+                if len(self._buffer) > MAX_HELD_CHARS:
+                    cut = self._buffer.rfind(" ", 0, MAX_HELD_CHARS) + 1 or MAX_HELD_CHARS
+                    said.append(self._sentence(self._buffer[:cut]))
+                    self._buffer = self._buffer[cut:]
+                    continue
                 break
             if sentence.group() == "\n" and not self._buffer[sentence.end() :].strip():
                 # A line break with nothing after it yet may be the first half

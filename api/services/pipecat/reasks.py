@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from api.services.pipecat.cut_off import CUT_OFF_MARKER
 
 COULD_NOT_UNDERSTAND = "could_not_understand"
+# How much of the reply as spoken so far is judged for a re-ask.
+REASK_WINDOW = 400
 THRESHOLD = 3
 _HAND_OFF_TOOLS = {COULD_NOT_UNDERSTAND, "transfer_call"}
 
@@ -66,12 +68,12 @@ REASK_PATTERNS = [
     # "Say that again?"
     re.compile(r"(?:^|[.!?—–-]\s*)(?:please\s+)?say\s+(?:that|it)\s+again\b", _I),
     # "could you say it one more time?" -- asked of the caller, not offered
-    re.compile(r"\byou\b[^.?!]{0,60}\b(?:one\s+more\s+time|once\s+more)\b[^.!]*\?", _I),
+    re.compile(r"\byou\b[^.?!]{0,60}\b(?:one\s+more\s+time|once\s+more)\b[^.!]{0,200}\?", _I),
     re.compile(r"\byou\s+(?:broke\s+up|(?:are|'re)\s+breaking\s+up|cut\s+out)\b", _I),
     re.compile(r"\btrouble\s+(?:hearing|understanding)\b", _I),
     # After an apology, asking afresh what they want is a re-ask too.
     re.compile(
-        rf"\b{_APOLOGY}\b[^?]*\b(?:what\s+(?:were|are)\s+you\s+calling\s+about|"
+        rf"\b{_APOLOGY}\b[^?]{{0,200}}\b(?:what\s+(?:were|are)\s+you\s+calling\s+about|"
         r"(?:tell\s+me\s+)?what\s+you\s+need)\b",
         _I,
     ),
@@ -230,7 +232,10 @@ class ReAskGuard:
         self.spoken += piece
         if self.before.handing_off:
             return True
-        if piece.strip() and not self.is_reask and is_reask(self.spoken):
+        # The last REASK_WINDOW characters: every pattern is a phrase, and
+        # judging the whole reply again for every sentence made a long reply
+        # cost the square of its length (MAX_HELD_CHARS in spoken_reasoning).
+        if piece.strip() and not self.is_reask and is_reask(self.spoken[-REASK_WINDOW:]):
             self.is_reask = True
         if self.is_reask and self.number >= THRESHOLD:
             # The third: not a word of the ask is said.
