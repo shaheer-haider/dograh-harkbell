@@ -71,6 +71,15 @@ class DograhOpenAIRealtimeLLMService(
         # start frame pushed; the provider's own "assistant item added" would
         # push a second (``push_frame``).
         self._manual_response_start_pushed = False
+        # One-off prompts that arrived before the session was ready; sent, in
+        # order, once it is.
+        self._appends_before_session_ready: list[LLMMessagesAppendFrame] = []
+        # A response this service asked for by hand and has not seen end. The
+        # provider refuses a second response on top of a live one, and says so
+        # in an error the receive loop only logs (``_maybe_handle_evt_...``).
+        self._manual_response_outstanding = False
+        # When the provider last heard the caller start speaking, in its clock.
+        self._caller_speech_started_ms: int | None = None
 
     # ------------------------------------------------------------------
     # Provider frames: ephemeral prompts and tool-call deferral
@@ -106,16 +115,18 @@ class DograhOpenAIRealtimeLLMService(
 
     async def _handle_messages_append(self, frame: LLMMessagesAppendFrame):
         """Consume a one-off append frame without mutating the local LLMContext."""
-        if self._disconnecting:
+        if self._disconnecting or self._conversation_closed:
             return
 
         if not self._api_session_ready:
-            if frame.run_llm:
-                logger.debug(
-                    f"{self}: LLMMessagesAppendFrame received before session ready; "
-                    "deferring response until the session is initialized"
-                )
-                self._run_llm_when_api_session_ready = True
+            # Kept, not dropped: upstream only remembered that a response was
+            # wanted, so a key pressed in the session's first moments was
+            # answered by a model that had never been told about it.
+            logger.debug(
+                f"{self}: LLMMessagesAppendFrame received before session ready; "
+                "holding it until the session is initialized"
+            )
+            self._appends_before_session_ready.append(frame)
             return
 
         appended_any = False
@@ -246,6 +257,9 @@ class DograhOpenAIRealtimeLLMService(
             await self._open_after_prerecorded_greeting(
                 *self._pending_prerecorded_greeting
             )
+        held, self._appends_before_session_ready = self._appends_before_session_ready, []
+        for frame in held:
+            await self._handle_messages_append(frame)
 
     async def _prepare_user_audio(self, frame):
         properties = self._settings.session_properties
@@ -319,6 +333,7 @@ class DograhOpenAIRealtimeLLMService(
         self._manual_response_start_pushed = False
         await self.push_frame(LLMFullResponseStartFrame())
         self._manual_response_start_pushed = True
+        self._manual_response_outstanding = True
         await self.start_processing_metrics()
         await self.start_ttfb_metrics()
         await self.send_client_event(
@@ -331,11 +346,53 @@ class DograhOpenAIRealtimeLLMService(
             )
         )
 
+    # The shortest stretch of sound that counts as the caller having spoken.
+    # "Hi" is about a third of a second; a click, a cough or a burst of line
+    # noise that turn detection calls speech is shorter.
+    _CALLER_SPEECH_MIN_MS = 250
+
+    async def _handle_evt_speech_started(self, evt):
+        self._caller_speech_started_ms = getattr(evt, "audio_start_ms", None)
+        await super()._handle_evt_speech_started(evt)
+
     async def _handle_evt_speech_stopped(self, evt):
         # Muted audio is silence the provider never calls speech, so this is
-        # the caller's own voice.
-        self.caller_speech_heard = True
+        # the caller's own line. A span too short to be a word does not count:
+        # the flag lets an end-call tool through, and noise at "hello" must not.
+        started, ended = self._caller_speech_started_ms, getattr(evt, "audio_end_ms", None)
+        if started is None or ended is None or ended - started >= self._CALLER_SPEECH_MIN_MS:
+            self.caller_speech_heard = True
         await super()._handle_evt_speech_stopped(evt)
+
+    # What in a provider error says no later request can succeed either: the
+    # account, not this turn.
+    _PERMANENT_ERROR_MARKERS = (
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "invalid_api_key",
+        "account_deactivated",
+        "billing_hard_limit",
+    )
+
+    async def _handle_evt_error(self, evt):
+        """End a call the provider will not answer, instead of leaving it silent.
+
+        Harkbell. Upstream reports every provider error the same way, as one
+        the call survives. An exhausted balance is not one: on 2026-11-14 the
+        account ran out of credits, the session was refused, and each caller
+        heard the recorded notice and then 66 seconds of nothing before the
+        silence timer hung up (staging runs 4911, 4912). Marked permanent, the
+        error costs this processor its usability and the engine ends the call
+        at once (``termination_funnel_processor.is_terminal_error``).
+        """
+        error = getattr(evt, "error", None)
+        described = " ".join(
+            str(getattr(error, field, "") or "") for field in ("type", "code", "message")
+        ).lower()
+        permanent = any(marker in described for marker in self._PERMANENT_ERROR_MARKERS)
+        await self.push_error(
+            error_msg=f"Error: {evt}", force_treat_as_permanent=permanent
+        )
 
     async def close_conversation(self) -> None:
         await super().close_conversation()
@@ -400,15 +457,35 @@ class DograhOpenAIRealtimeLLMService(
         # A response that was only a tool call adds no assistant item, so the
         # flag would otherwise swallow the next response's start.
         self._manual_response_start_pushed = False
+        self._manual_response_outstanding = False
         await super()._handle_evt_response_done(evt)
-        if self._run_llm_after_response_done:
-            self._run_llm_after_response_done = False
-            await self._send_manual_response_create()
+        # The ended response settles its own deferred tool first: a prompt
+        # queued behind it starts a new response, and a tool released after
+        # that would be read as belonging to it and dropped.
         await self._workflow_tool_deferral.complete_response(
             evt.response.id,
             speaking=self._workflow_bot_is_speaking,
             succeeded=evt.response.status == "completed",
         )
+        if self._run_llm_after_response_done:
+            self._run_llm_after_response_done = False
+            await self._send_manual_response_create()
+
+    async def _maybe_handle_evt_retrieve_conversation_item_error(self, evt):
+        """Notice a refused response before the receive loop only logs it.
+
+        A response asked for by hand between the provider starting a reply
+        and its first item arriving is refused ("conversation already has an
+        active response"), and upstream swallows that at debug. The prompt it
+        was for -- a keypress -- is then asked again when the live reply ends.
+        """
+        code = getattr(getattr(evt, "error", None), "code", None)
+        if code == "conversation_already_has_active_response" and self._manual_response_outstanding:
+            logger.info(f"{self}: a requested response was refused over a live one; asking again after it")
+            self._manual_response_outstanding = False
+            self._manual_response_start_pushed = False
+            self._run_llm_after_response_done = True
+        return await super()._maybe_handle_evt_retrieve_conversation_item_error(evt)
 
     # ------------------------------------------------------------------
     # Transcription: broadcast with finalized=True for every

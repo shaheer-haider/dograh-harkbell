@@ -138,3 +138,102 @@ async def test_the_caller_counts_as_heard_before_their_transcript_arrives():
     assert manager._realtime_caller_heard() is False
     manager._engine = SimpleNamespace(active_agent=SimpleNamespace(llm=object()))
     assert manager._realtime_caller_heard() is False
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_account_ends_the_call_and_a_passing_error_does_not():
+    """A refused session left callers in a minute of silence (staging run 4911)."""
+    service = _service()
+    service.push_error = AsyncMock()
+
+    def error(**fields):
+        return SimpleNamespace(error=SimpleNamespace(**fields))
+
+    await service._handle_evt_error(
+        error(type="insufficient_quota", code="credit_balance_exhausted", message="You have no credits remaining.")
+    )
+    assert service.push_error.await_args.kwargs["force_treat_as_permanent"] is True
+
+    await service._handle_evt_error(error(type="invalid_request_error", code="invalid_api_key", message="Incorrect API key"))
+    assert service.push_error.await_args.kwargs["force_treat_as_permanent"] is True
+
+    await service._handle_evt_error(error(type="server_error", code=None, message="The server had an error"))
+    assert service.push_error.await_args.kwargs["force_treat_as_permanent"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_click_is_not_the_caller_speaking_and_a_word_is():
+    with (
+        patch.object(OpenAIRealtimeLLMService, "_handle_evt_speech_started", AsyncMock()),
+        patch.object(OpenAIRealtimeLLMService, "_handle_evt_speech_stopped", AsyncMock()),
+    ):
+        click = _service()
+        await click._handle_evt_speech_started(SimpleNamespace(audio_start_ms=1000))
+        await click._handle_evt_speech_stopped(SimpleNamespace(audio_end_ms=1120))
+        assert click.caller_speech_heard is False
+
+        word = _service()
+        await word._handle_evt_speech_started(SimpleNamespace(audio_start_ms=1000))
+        await word._handle_evt_speech_stopped(SimpleNamespace(audio_end_ms=1400))
+        assert word.caller_speech_heard is True
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_before_the_session_is_ready_is_kept_and_sent_when_it_is():
+    from pipecat.frames.frames import LLMMessagesAppendFrame
+
+    service = _service()
+    service._api_session_ready = False
+    service._send_manual_response_create = AsyncMock()
+    frame = LLMMessagesAppendFrame([{"role": "user", "content": "[keypad] 1"}], run_llm=True)
+    await service._handle_messages_append(frame)
+    service.send_client_event.assert_not_awaited()
+    assert service._appends_before_session_ready == [frame]
+
+    await service._handle_evt_session_updated(SimpleNamespace())
+    sent = [call.args[0] for call in service.send_client_event.await_args_list]
+    assert any(isinstance(event, events.ConversationItemCreateEvent) for event in sent)
+    service._send_manual_response_create.assert_awaited_once()
+    assert service._appends_before_session_ready == []
+
+
+@pytest.mark.asyncio
+async def test_a_response_refused_over_a_live_one_is_asked_again_when_it_ends():
+    service = _service()
+    service._manual_response_outstanding = True
+    with patch.object(
+        OpenAIRealtimeLLMService,
+        "_maybe_handle_evt_retrieve_conversation_item_error",
+        AsyncMock(return_value=False),
+    ):
+        handled = await service._maybe_handle_evt_retrieve_conversation_item_error(
+            SimpleNamespace(error=SimpleNamespace(code="conversation_already_has_active_response"))
+        )
+    assert handled is False
+    assert service._run_llm_after_response_done is True
+    # An error that is not about a response of ours changes nothing.
+    other = _service()
+    with patch.object(
+        OpenAIRealtimeLLMService,
+        "_maybe_handle_evt_retrieve_conversation_item_error",
+        AsyncMock(return_value=False),
+    ):
+        await other._maybe_handle_evt_retrieve_conversation_item_error(
+            SimpleNamespace(error=SimpleNamespace(code="conversation_already_has_active_response"))
+        )
+    assert other._run_llm_after_response_done is False
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_asked_of_the_model_after_the_conversation_closed():
+    from pipecat.frames.frames import LLMMessagesAppendFrame
+
+    service = _service()
+    service._send_manual_response_create = AsyncMock()
+    await service.close_conversation()
+    service.send_client_event.reset_mock()
+    await service._handle_messages_append(
+        LLMMessagesAppendFrame([{"role": "user", "content": "The user has been quiet."}], run_llm=True)
+    )
+    service.send_client_event.assert_not_awaited()
+    service._send_manual_response_create.assert_not_awaited()
