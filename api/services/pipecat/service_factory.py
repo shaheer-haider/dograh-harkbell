@@ -1448,6 +1448,19 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
         transcription_kwargs = {}
         if language:
             transcription_kwargs["language"] = language
+        # Harkbell (-harkbell.28): which model writes the caller's transcript,
+        # and the words it should get right. Unset, the session opens with the
+        # provider's default transcriber and no keywords, as it always did.
+        transcription_model = getattr(realtime_config, "transcription_model", None)
+        if transcription_model:
+            transcription_kwargs["model"] = transcription_model
+        transcription_keywords = [
+            keyword.strip()
+            for keyword in (
+                getattr(realtime_config, "transcription_keywords", None) or []
+            )
+            if isinstance(keyword, str) and keyword.strip()
+        ]
 
         # Harkbell: the session tuning the configuration may carry. Whatever
         # is unset is not sent, so the provider's default stands.
@@ -1455,6 +1468,7 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
         turn_detection = getattr(realtime_config, "turn_detection", None)
         vad_threshold = getattr(realtime_config, "vad_threshold", None)
         vad_silence_ms = getattr(realtime_config, "vad_silence_ms", None)
+        vad_prefix_padding_ms = getattr(realtime_config, "vad_prefix_padding_ms", None)
         if turn_detection == "semantic_vad":
             input_kwargs["turn_detection"] = SemanticTurnDetection(
                 eagerness=getattr(realtime_config, "vad_eagerness", None)
@@ -1463,11 +1477,17 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
             turn_detection == "server_vad"
             or vad_threshold is not None
             or vad_silence_ms is not None
+            or vad_prefix_padding_ms is not None
         ):
             defaults = TurnDetection()
             input_kwargs["turn_detection"] = TurnDetection(
                 threshold=(
                     vad_threshold if vad_threshold is not None else defaults.threshold
+                ),
+                prefix_padding_ms=(
+                    vad_prefix_padding_ms
+                    if vad_prefix_padding_ms is not None
+                    else defaults.prefix_padding_ms
                 ),
                 silence_duration_ms=(
                     vad_silence_ms
@@ -1491,6 +1511,7 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
 
         return DograhOpenAIRealtimeLLMService(
             api_key=api_key,
+            transcription_keywords=transcription_keywords,
             settings=DograhOpenAIRealtimeLLMService.Settings(
                 model=model,
                 session_properties=SessionProperties(

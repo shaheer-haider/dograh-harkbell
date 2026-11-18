@@ -989,6 +989,37 @@ class OpenAIRealtimeLLMConfiguration(BaseLLMConfiguration):
         description="How fast the voice speaks (1.0 is the model's own pace).",
         json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
     )
+    # Harkbell (-harkbell.28): the caller's transcript. The model hears the
+    # audio itself; this is the side channel that writes down what was said,
+    # which the run's record, extraction and the dashboard all read.
+    transcription_model: str | None = Field(
+        default=None,
+        description=(
+            "The model that writes the caller's transcript (gpt-live-transcribe, "
+            "gpt-4o-transcribe). Leave unset for the provider's default."
+        ),
+        json_schema_extra={
+            "examples": ["gpt-live-transcribe", "gpt-4o-transcribe"],
+            "allow_custom_input": True,
+            "hidden_for_models": ["gpt-live-1"],
+        },
+    )
+    transcription_keywords: list[str] | None = Field(
+        default=None,
+        max_length=100,
+        description=(
+            "Words and phrases the transcript should get right: names, products, "
+            "trade terms. Only the gpt-transcribe family reads them."
+        ),
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
+    vad_prefix_padding_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=2000,
+        description="server_vad only: audio kept from before speech was detected, in ms.",
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
 
     @model_validator(mode="before")
     @classmethod

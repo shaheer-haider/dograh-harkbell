@@ -55,6 +55,14 @@ class DograhOpenAIRealtimeLLMService(
     _workflow_tools_follow_voice_response = False
 
     def __init__(self, **kwargs):
+        # Harkbell (-harkbell.28): words the caller's transcript should get
+        # right. The gpt-transcribe family reads ``keywords`` on the session's
+        # transcription settings; Pipecat's model of those settings has no such
+        # field and drops one on the way out, so they are written onto the
+        # outgoing ``session.update`` instead (``_ws_send``).
+        self._transcription_keywords: list[str] = list(
+            kwargs.pop("transcription_keywords", None) or []
+        )
         super().__init__(**kwargs)
         # Track bot speech locally so workflow-control calls can wait until the
         # bot has finished speaking without delaying ordinary tools.
@@ -84,6 +92,31 @@ class DograhOpenAIRealtimeLLMService(
     # ------------------------------------------------------------------
     # Provider frames: ephemeral prompts and tool-call deferral
     # ------------------------------------------------------------------
+
+    def _with_transcription_keywords(self, realtime_message):
+        """The outgoing message, with the transcript keywords on a session update."""
+        if (
+            not self._transcription_keywords
+            or not isinstance(realtime_message, dict)
+            or realtime_message.get("type") != "session.update"
+        ):
+            return realtime_message
+        transcription = (
+            ((realtime_message.get("session") or {}).get("audio") or {}).get("input")
+            or {}
+        ).get("transcription")
+        # Only the gpt-transcribe family reads keywords; the provider refuses
+        # the whole update for any other transcriber ("not supported for this
+        # model", probed 2026-11-18), and a refused update is a call with no
+        # settings at all.
+        if isinstance(transcription, dict) and str(
+            transcription.get("model") or ""
+        ).startswith(("gpt-transcribe", "gpt-live-transcribe")):
+            transcription["keywords"] = list(self._transcription_keywords)
+        return realtime_message
+
+    async def _ws_send(self, realtime_message):
+        await super()._ws_send(self._with_transcription_keywords(realtime_message))
 
     async def push_frame(
         self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
@@ -257,7 +290,10 @@ class DograhOpenAIRealtimeLLMService(
             await self._open_after_prerecorded_greeting(
                 *self._pending_prerecorded_greeting
             )
-        held, self._appends_before_session_ready = self._appends_before_session_ready, []
+        held, self._appends_before_session_ready = (
+            self._appends_before_session_ready,
+            [],
+        )
         for frame in held:
             await self._handle_messages_append(frame)
 
@@ -359,8 +395,15 @@ class DograhOpenAIRealtimeLLMService(
         # Muted audio is silence the provider never calls speech, so this is
         # the caller's own line. A span too short to be a word does not count:
         # the flag lets an end-call tool through, and noise at "hello" must not.
-        started, ended = self._caller_speech_started_ms, getattr(evt, "audio_end_ms", None)
-        if started is None or ended is None or ended - started >= self._CALLER_SPEECH_MIN_MS:
+        started, ended = (
+            self._caller_speech_started_ms,
+            getattr(evt, "audio_end_ms", None),
+        )
+        if (
+            started is None
+            or ended is None
+            or ended - started >= self._CALLER_SPEECH_MIN_MS
+        ):
             self.caller_speech_heard = True
         await super()._handle_evt_speech_stopped(evt)
 
@@ -387,7 +430,8 @@ class DograhOpenAIRealtimeLLMService(
         """
         error = getattr(evt, "error", None)
         described = " ".join(
-            str(getattr(error, field, "") or "") for field in ("type", "code", "message")
+            str(getattr(error, field, "") or "")
+            for field in ("type", "code", "message")
         ).lower()
         permanent = any(marker in described for marker in self._PERMANENT_ERROR_MARKERS)
         await self.push_error(
@@ -480,8 +524,13 @@ class DograhOpenAIRealtimeLLMService(
         was for -- a keypress -- is then asked again when the live reply ends.
         """
         code = getattr(getattr(evt, "error", None), "code", None)
-        if code == "conversation_already_has_active_response" and self._manual_response_outstanding:
-            logger.info(f"{self}: a requested response was refused over a live one; asking again after it")
+        if (
+            code == "conversation_already_has_active_response"
+            and self._manual_response_outstanding
+        ):
+            logger.info(
+                f"{self}: a requested response was refused over a live one; asking again after it"
+            )
             self._manual_response_outstanding = False
             self._manual_response_start_pushed = False
             self._run_llm_after_response_done = True
