@@ -46,6 +46,34 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 
 
+def _accept_unknown_transcription_fields() -> None:
+    """Harkbell (-harkbell.29): read a transcription block Pipecat does not know.
+
+    Pipecat's ``InputAudioTranscription`` takes ``model``, ``language`` and
+    ``prompt`` through a hand-written ``__init__``, so any other key is a
+    ``TypeError``. The provider's ``session.updated`` for the gpt-transcribe
+    family echoes ``languages`` and ``keywords`` in that block, parsing it
+    raised, the receive loop died on the session's first event and the caller
+    heard the notice and then nothing - every realtime call, for the twenty
+    minutes ``-harkbell.28``'s ``transcription_model`` was in use
+    (2026-11-18, runs 5670-5675). The echo is not something the engine reads,
+    so fields it does not know are dropped rather than refused.
+    """
+    known = ("model", "language", "prompt")
+    original = events.InputAudioTranscription.__init__
+    if getattr(original, "_harkbell_tolerant", False):
+        return
+
+    def tolerant(self, *args, **kwargs):
+        original(self, *args, **{key: kwargs[key] for key in known if key in kwargs})
+
+    tolerant._harkbell_tolerant = True
+    events.InputAudioTranscription.__init__ = tolerant
+
+
+_accept_unknown_transcription_fields()
+
+
 class DograhOpenAIRealtimeLLMService(
     RealtimeConversationMixin, OpenAIRealtimeLLMService
 ):
