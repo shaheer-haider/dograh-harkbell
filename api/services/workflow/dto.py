@@ -372,6 +372,20 @@ class StartCallNodeData(
     take_pathway_without_model: bool = spec_field(
         default=False, ui_type=PropertyType.boolean, spec_exclude=True
     )
+    # Harkbell: recordings of the greeting as it can come out, each
+    # ``{"text": <the greeting as rendered>, "recording_id": <primary key>}``.
+    # A greeting with a variable in it -- the keypad sentence the pre-call
+    # fetch fills on a phone call while the team is in, and leaves empty
+    # otherwise -- cannot be one recording, so it stayed text; on a realtime
+    # line the model is then asked to say it as written, and the smaller model
+    # dropped the key sentence on one call and thought aloud in front of it on
+    # another (copy runs 5758 and 5761, 2026-11-18). The entry whose text is
+    # this call's greeting plays instead; with none, the greeting is spoken as
+    # before. Set by the workflows Harkbell generates; kept out of the node
+    # spec and the editor.
+    greeting_recordings: Optional[list[dict[str, str]]] = spec_field(
+        default=None, ui_type=PropertyType.json, spec_exclude=True
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -498,6 +512,20 @@ class AgentNodeData(
     )
     greeting_recording_id: Optional[str] = spec_field(
         default=None, ui_type=PropertyType.recording_ref, spec_exclude=True
+    )
+    # Harkbell: recordings of the greeting as it can come out, each
+    # ``{"text": <the greeting as rendered>, "recording_id": <primary key>}``.
+    # A greeting with a variable in it -- the keypad sentence the pre-call
+    # fetch fills on a phone call while the team is in, and leaves empty
+    # otherwise -- cannot be one recording, so it stayed text; on a realtime
+    # line the model is then asked to say it as written, and the smaller model
+    # dropped the key sentence on one call and thought aloud in front of it on
+    # another (copy runs 5758 and 5761, 2026-11-18). The entry whose text is
+    # this call's greeting plays instead; with none, the greeting is spoken as
+    # before. Set by the workflows Harkbell generates; kept out of the node
+    # spec and the editor.
+    greeting_recordings: Optional[list[dict[str, str]]] = spec_field(
+        default=None, ui_type=PropertyType.json, spec_exclude=True
     )
 
 

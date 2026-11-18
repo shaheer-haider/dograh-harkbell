@@ -1033,8 +1033,40 @@ class PipecatEngine:
             return ("audio", node.greeting_recording_id)
 
         if node.greeting:
-            return ("text", self._format_prompt(node.greeting))
+            rendered = self._format_prompt(node.greeting)
+            recording = self._recording_of_greeting(node, rendered)
+            if recording:
+                return ("audio", recording)
+            return ("text", rendered)
 
+        return None
+
+    def _recording_of_greeting(self, node, rendered: str) -> Optional[str]:
+        """The recording of this call's greeting, when the node holds one.
+
+        Harkbell. A greeting with a variable in it has one recording per way
+        it can come out (``greeting_recordings``); the one whose words are the
+        rendered greeting, spaces aside, is played in place of speaking it.
+        Only where a recording can play: a text chat has no audio out, and is
+        given the words.
+        """
+        variants = getattr(node, "greeting_recordings", None)
+        if not isinstance(variants, list) or not variants:
+            return None
+        if not self._fetch_recording_audio or self._transport_output is None:
+            return None
+        wanted = " ".join(str(rendered).split())
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            text = variant.get("text")
+            recording_id = variant.get("recording_id")
+            if (
+                isinstance(text, str)
+                and " ".join(text.split()) == wanted
+                and str(recording_id or "").strip()
+            ):
+                return str(recording_id).strip()
         return None
 
     def get_start_greeting(self) -> Optional[tuple[str, Optional[str]]]:

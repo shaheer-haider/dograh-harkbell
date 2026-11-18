@@ -95,3 +95,116 @@ async def test_a_text_chat_opens_with_the_notice_then_the_steps_greeting():
     assert window.outputs == [NOTICE, SPOKEN]
     assert llm.captured_contexts == []
     assert engine.active_agent.current_node.id == "harkbell-main"
+
+
+# ── A greeting with a variable in it, and a recording for each way it comes out ──────────
+# Copy runs 5758 and 5761 (2026-11-18): the keypad sentence makes the greeting different
+# per call, so it could not be recorded, and the realtime model was asked to say it as
+# written. The smaller model dropped the key sentence once and thought aloud in front of
+# it once in eight calls. A node may now carry a recording per rendering.
+
+TEMPLATE = "{{initial_context.keypad_announcement}}Hi, this is Emma at Mirror Labs. How can I help you?"
+PLAIN = "Hi, this is Emma at Mirror Labs. How can I help you?"
+KEYED = "For events in the next 48 hours, press 1. " + PLAIN
+RECORDINGS = [
+    {"text": KEYED, "recording_id": "11"},
+    {"text": PLAIN, "recording_id": "12"},
+]
+
+
+def _graph_with_recordings(recordings=RECORDINGS, greeting=TEMPLATE):
+    definition = screening_definition(main_greeting=greeting)
+    main = next(n for n in definition["nodes"] if n["id"] == "harkbell-main")
+    main["data"]["greeting_recordings"] = recordings
+    return WorkflowGraph(ReactFlowDTO.model_validate(definition))
+
+
+def _engine_for(graph, *, announcement=None, audio=True):
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    from api.services.workflow.pipecat_engine import PipecatEngine
+
+    engine = PipecatEngine(
+        llm=_unused_model(),
+        context=LLMContext(),
+        workflow=graph,
+        call_context_vars=(
+            {"keypad_announcement": announcement} if announcement is not None else {}
+        ),
+        workflow_run_id=1,
+    )
+    if audio:
+
+        async def fetch_recording(*, recording_pk=None, recording_id=None):
+            return None
+
+        engine.set_fetch_recording_audio(fetch_recording)
+        engine._transport_output = object()
+    return engine
+
+
+def test_the_recording_of_this_calls_greeting_is_the_one_that_plays():
+    graph = _graph_with_recordings()
+    in_hours = _engine_for(graph, announcement="For events in the next 48 hours, press 1. ")
+    assert in_hours.get_node_greeting("harkbell-main") == ("audio", "11")
+    # No announcement on this call -- out of hours, or a website call.
+    assert _engine_for(graph).get_node_greeting("harkbell-main") == ("audio", "12")
+    assert _engine_for(graph, announcement="").get_node_greeting("harkbell-main") == ("audio", "12")
+    # Spaces are the template's, not the words': a doubled or missing one still matches.
+    spaced = _engine_for(graph, announcement="For events in the next 48 hours,  press 1.  ")
+    assert spaced.get_node_greeting("harkbell-main") == ("audio", "11")
+
+
+def test_a_greeting_no_recording_was_made_of_is_spoken_as_before():
+    graph = _graph_with_recordings()
+    changed = _engine_for(graph, announcement="Press 9 for the box office. ")
+    assert changed.get_node_greeting("harkbell-main") == (
+        "text",
+        "Press 9 for the box office. " + PLAIN,
+    )
+    # No list, an empty one, or entries that are not usable: the text, never a guess.
+    # (An entry that is not an object at all is refused when the workflow is saved.)
+    for recordings in (None, [], [{"text": PLAIN}], [{"recording_id": "12"}]):
+        engine = _engine_for(_graph_with_recordings(recordings=recordings))
+        assert engine.get_node_greeting("harkbell-main") == ("text", PLAIN), recordings
+
+
+def test_a_text_chat_is_given_the_words_not_a_recording():
+    engine = _engine_for(_graph_with_recordings(), audio=False)
+    assert engine.get_node_greeting("harkbell-main") == ("text", PLAIN)
+
+
+def test_a_configured_recording_still_wins_over_the_list():
+    definition = screening_definition(main_greeting=TEMPLATE)
+    main = next(n for n in definition["nodes"] if n["id"] == "harkbell-main")
+    main["data"] |= {
+        "greeting_type": "audio",
+        "greeting_recording_id": "40",
+        "greeting_recordings": RECORDINGS,
+    }
+    engine = _engine_for(WorkflowGraph(ReactFlowDTO.model_validate(definition)))
+    assert engine.get_node_greeting("harkbell-main") == ("audio", "40")
+
+
+@pytest.mark.asyncio
+async def test_on_a_call_the_recording_plays_and_nothing_is_synthesised_for_the_greeting():
+    from types import SimpleNamespace
+
+    asked = []
+
+    async def fetch_recording(*, recording_pk=None, recording_id=None):
+        asked.append(recording_pk if recording_pk is not None else recording_id)
+        return SimpleNamespace(audio=b"\x01\x00" * 3200, transcript=PLAIN)
+
+    llm = _unused_model()
+    engine, tts, context = await _run_call(
+        _graph_with_recordings(),
+        llm,
+        fetch_recording=fetch_recording,
+        until=lambda llm, tts: 12 in asked,
+    )
+    # The notice is this fixture's text; the greeting came from recording 12.
+    assert tts.received_texts == [NOTICE]
+    assert asked == [12]
+    assert llm.captured_contexts == []
+    assert [m["content"] for m in context.messages if m.get("role") == "assistant"] == [PLAIN]
