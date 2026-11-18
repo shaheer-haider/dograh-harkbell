@@ -1316,6 +1316,15 @@ async def _run_pipeline_impl(
         assistant_context_aggregator,
     )
 
+    # Harkbell: the caller's own words, as transcribed, where a tool can check
+    # what the model heard against them (``PipecatEngine.note_caller_turn``).
+    @user_context_aggregator.event_handler("on_user_turn_message_added")
+    async def _note_caller_turn(aggregator, message):
+        try:
+            engine.note_caller_turn(message.content)
+        except Exception as e:
+            logger.error(f"Failed to keep the caller's turn for tools: {e}")
+
     # Register event handlers — resolve provider_id for PostHog tracking
     if not user_provider_id:
         user_obj = await db_client.get_user_by_id(user_id)

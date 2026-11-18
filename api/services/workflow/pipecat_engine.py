@@ -211,6 +211,8 @@ class PipecatEngine:
         self._call_disposed = False
         self._shutdown_task: asyncio.Task | None = None
         self._gathered_context: dict = {}
+        # The caller's last turns as transcribed (``note_caller_turn``).
+        self._caller_turns: list[str] = []
         self._response_timeout_task: Optional[asyncio.Task] = None
         self._pending_extraction_tasks: set[asyncio.Task] = set()
         # True once terminal call disposal has run its synchronous extraction.
@@ -2339,6 +2341,35 @@ class PipecatEngine:
     def set_fetch_recording_audio(self, fetch_fn) -> None:
         """Set the recording audio fetcher callback."""
         self._fetch_recording_audio = fetch_fn
+
+    # How much of what the caller said a tool is handed: the last few turns,
+    # which is where an order number and its correction are.
+    CALLER_SAID_TURNS = 8
+    CALLER_SAID_CHARS = 900
+
+    def note_caller_turn(self, text) -> None:
+        """Keep the caller's last turns, as transcribed, where a tool can read them.
+
+        Harkbell. A realtime model hears the caller itself, and the transcript
+        is a second, separate reading of the same audio. On the Mirror Labs
+        copy (2026-11-19) the smaller model filed a nine-digit order number
+        given in two halves wrong on six runs out of six -- "65844957",
+        "644957", "44957" for 658744957 -- while the transcript had both
+        halves right every time. A tool cannot check the number against words
+        it is never given, so they ride the run's context as ``caller_said``:
+        a preset ``{{gathered_context.caller_said}}`` hands them to a tool
+        with the call, turns joined by " | ", oldest first.
+
+        A key press is not something they said, and is left out.
+        """
+        words = " ".join(str(text or "").split())
+        if not words or words.startswith("[keypad]"):
+            return
+        self._caller_turns.append(words)
+        del self._caller_turns[: -self.CALLER_SAID_TURNS]
+        self._gathered_context["caller_said"] = " | ".join(self._caller_turns)[
+            -self.CALLER_SAID_CHARS :
+        ]
 
     def set_mute_pipeline(self, mute: bool) -> None:
         """Set the pipeline mute state.
