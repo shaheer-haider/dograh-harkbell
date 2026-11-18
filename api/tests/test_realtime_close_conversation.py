@@ -237,3 +237,106 @@ async def test_nothing_is_asked_of_the_model_after_the_conversation_closed():
     )
     service.send_client_event.assert_not_awaited()
     service._send_manual_response_create.assert_not_awaited()
+
+
+def _response_done(status: str, error: dict | None = None, response_id: str = "resp_1"):
+    """A ``response.done`` as the provider sends it, down to what the engine reads."""
+    tokens = SimpleNamespace(cached_tokens=0, audio_tokens=0, cached_tokens_details=None)
+    usage = SimpleNamespace(
+        input_tokens=0,
+        output_tokens=0,
+        total_tokens=0,
+        input_token_details=tokens,
+        output_token_details=SimpleNamespace(audio_tokens=0),
+    )
+    details = {"type": status, "error": error} if error else None
+    return SimpleNamespace(
+        response=SimpleNamespace(
+            id=response_id, status=status, status_details=details, usage=usage, output=[]
+        )
+    )
+
+
+def _service_reporting_errors() -> DograhOpenAIRealtimeLLMService:
+    """A service whose real error path runs, with nothing wired around it."""
+    service = _service()
+    service.start_llm_usage_metrics = AsyncMock()
+    service.stop_processing_metrics = AsyncMock()
+    service.push_frame = AsyncMock()
+    service._workflow_tool_deferral.complete_response = AsyncMock()
+    return service
+
+
+NO_CREDITS = (
+    "You have no credits remaining. Add credits to continue using the API at "
+    "https://platform.openai.com/settings/organization/billing/."
+)
+
+
+@pytest.mark.asyncio
+async def test_a_balance_that_runs_out_mid_call_ends_the_call_at_the_first_failed_reply():
+    """Seven failed replies and 76 seconds of silence (production run 5720)."""
+    # The message alone, which is all run 5720's log proves the provider sent.
+    by_message = _service_reporting_errors()
+    await by_message._handle_evt_response_done(_response_done("failed", {"message": NO_CREDITS}))
+    assert by_message.is_usable is False
+
+    by_code = _service_reporting_errors()
+    await by_code._handle_evt_response_done(
+        _response_done("failed", {"type": "insufficient_quota", "code": "insufficient_quota", "message": "x"})
+    )
+    assert by_code.is_usable is False
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_fails_in_passing_costs_one_turn_and_the_third_in_a_row_ends_the_call():
+    passing = {"type": "server_error", "code": None, "message": "The server had an error"}
+    service = _service_reporting_errors()
+
+    await service._handle_evt_response_done(_response_done("failed", passing))
+    await service._handle_evt_response_done(_response_done("failed", passing))
+    assert service.is_usable is True
+    # The caller talking over a reply is not a failure, and does not clear two.
+    await service._handle_evt_response_done(_response_done("cancelled"))
+    assert service.is_usable is True
+    await service._handle_evt_response_done(_response_done("failed", passing))
+    assert service.is_usable is False
+
+    recovered = _service_reporting_errors()
+    await recovered._handle_evt_response_done(_response_done("failed", passing))
+    await recovered._handle_evt_response_done(_response_done("failed", passing))
+    await recovered._handle_evt_response_done(_response_done("completed"))
+    await recovered._handle_evt_response_done(_response_done("failed", passing))
+    assert recovered.is_usable is True
+
+
+@pytest.mark.asyncio
+async def test_an_error_after_a_failed_reply_is_judged_on_its_own():
+    """The verdict on one response must not make the next passing error the call's last."""
+    service = _service_reporting_errors()
+    with patch.object(OpenAIRealtimeLLMService, "_handle_evt_response_done", AsyncMock()):
+        # Upstream reported nothing for it: the verdict is dropped with the response.
+        await service._handle_evt_response_done(_response_done("failed", {"message": NO_CREDITS}))
+    await service.push_error(error_msg="Send error: one dropped packet")
+    assert service.is_usable is True
+
+
+@pytest.mark.asyncio
+async def test_a_real_reply_passes_through_and_the_same_reply_failed_ends_the_call():
+    """The provider's own ``response.done``, parsed as the receive loop parses it."""
+    import json
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "openai_realtime_live_transcribe_session.json"
+    done = next(e for e in json.loads(fixture.read_text()) if e["type"] == "response.done")
+
+    service = _service_reporting_errors()
+    service._call_event_handler = AsyncMock()
+    await service._handle_evt_response_done(events.parse_server_event(json.dumps(done)))
+    assert service.is_usable is True
+    assert service._failed_responses_in_a_row == 0
+
+    done["response"]["status"] = "failed"
+    done["response"]["status_details"] = {"type": "failed", "error": {"message": NO_CREDITS}}
+    await service._handle_evt_response_done(events.parse_server_event(json.dumps(done)))
+    assert service.is_usable is False

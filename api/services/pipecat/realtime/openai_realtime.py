@@ -116,6 +116,12 @@ class DograhOpenAIRealtimeLLMService(
         self._manual_response_outstanding = False
         # When the provider last heard the caller start speaking, in its clock.
         self._caller_speech_started_ms: int | None = None
+        # Harkbell (-harkbell.30): the response that just ended failed for a
+        # reason no later response escapes; the error Pipecat is about to
+        # report for it is the call's last (``push_error``).
+        self._response_failed_for_good = False
+        # Responses that failed one after another, with none completing between.
+        self._failed_responses_in_a_row = 0
 
     # ------------------------------------------------------------------
     # Provider frames: ephemeral prompts and tool-call deferral
@@ -443,7 +449,73 @@ class DograhOpenAIRealtimeLLMService(
         "invalid_api_key",
         "account_deactivated",
         "billing_hard_limit",
+        # The message itself: a failed response is reported by its message
+        # alone, and this is the one an empty balance sent (run 5720).
+        "no credits remaining",
     )
+
+    # A line whose every reply fails is a silent line whatever the reason, so
+    # the third failure in a row ends the call even when nothing names it.
+    _FAILED_RESPONSES_BEFORE_ENDING_THE_CALL = 3
+
+    @classmethod
+    def _is_refused_for_good(cls, error) -> bool:
+        """Whether a provider's error says the account, not this turn, is refused.
+
+        ``error`` is the provider's error as an object or as a mapping; either
+        way its type, code and message are read together.
+        """
+        if error is None:
+            return False
+        read = error.get if isinstance(error, dict) else lambda field: getattr(error, field, None)
+        described = " ".join(str(read(field) or "") for field in ("type", "code", "message")).lower()
+        return any(marker in described for marker in cls._PERMANENT_ERROR_MARKERS)
+
+    def _note_response_outcome(self, response) -> None:
+        """Decide whether the response that just ended is the call's last.
+
+        Harkbell (-harkbell.30). A balance that runs out *during* a call is not
+        an ``error`` event: the session stays open and each reply the caller
+        asks for comes back as a response whose status is ``failed``. Upstream
+        reports that as an error the call survives, so the caller spoke into
+        silence -- seven failed replies and 76 seconds on the operator's own
+        call (production run 5720, 2026-11-18) -- until they hung up.
+        """
+        status = getattr(response, "status", None)
+        if status == "completed":
+            self._failed_responses_in_a_row = 0
+            return
+        if status != "failed":
+            # Cancelled by the caller speaking, or cut short: neither a reply
+            # that worked nor one the provider refused.
+            return
+        self._failed_responses_in_a_row += 1
+        details = getattr(response, "status_details", None)
+        error = details.get("error") if isinstance(details, dict) else getattr(details, "error", None)
+        self._response_failed_for_good = (
+            self._is_refused_for_good(error)
+            or self._failed_responses_in_a_row >= self._FAILED_RESPONSES_BEFORE_ENDING_THE_CALL
+        )
+
+    async def push_error(
+        self,
+        error_msg: str,
+        exception: Exception | None = None,
+        fatal: bool = False,
+        category=None,
+        force_treat_as_permanent: bool = False,
+    ):
+        """Report an error, as the call's last when a failed response made it so."""
+        if self._response_failed_for_good:
+            self._response_failed_for_good = False
+            force_treat_as_permanent = True
+        await super().push_error(
+            error_msg,
+            exception=exception,
+            fatal=fatal,
+            category=category,
+            force_treat_as_permanent=force_treat_as_permanent,
+        )
 
     async def _handle_evt_error(self, evt):
         """End a call the provider will not answer, instead of leaving it silent.
@@ -456,14 +528,9 @@ class DograhOpenAIRealtimeLLMService(
         error costs this processor its usability and the engine ends the call
         at once (``termination_funnel_processor.is_terminal_error``).
         """
-        error = getattr(evt, "error", None)
-        described = " ".join(
-            str(getattr(error, field, "") or "")
-            for field in ("type", "code", "message")
-        ).lower()
-        permanent = any(marker in described for marker in self._PERMANENT_ERROR_MARKERS)
         await self.push_error(
-            error_msg=f"Error: {evt}", force_treat_as_permanent=permanent
+            error_msg=f"Error: {evt}",
+            force_treat_as_permanent=self._is_refused_for_good(getattr(evt, "error", None)),
         )
 
     async def close_conversation(self) -> None:
@@ -530,7 +597,12 @@ class DograhOpenAIRealtimeLLMService(
         # flag would otherwise swallow the next response's start.
         self._manual_response_start_pushed = False
         self._manual_response_outstanding = False
-        await super()._handle_evt_response_done(evt)
+        self._note_response_outcome(evt.response)
+        try:
+            await super()._handle_evt_response_done(evt)
+        finally:
+            # Only the error reported for this response may be made permanent.
+            self._response_failed_for_good = False
         # The ended response settles its own deferred tool first: a prompt
         # queued behind it starts a new response, and a tool released after
         # that would be read as belonging to it and dropped.
