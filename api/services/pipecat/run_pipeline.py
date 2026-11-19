@@ -38,6 +38,9 @@ from api.services.pipecat.agent_runtime_factory import (
 )
 from api.services.pipecat.audio_config import AudioConfig, create_audio_config
 from api.services.pipecat.cut_off import harkbell_context_aggregators
+from api.services.pipecat.elevenlabs_manual_stt import (
+    HarkbellElevenLabsRealtimeSTTService,
+)
 from api.services.pipecat.event_handlers import (
     register_audio_data_handler,
     register_event_handlers,
@@ -1041,6 +1044,14 @@ async def _run_pipeline_impl(
             uses_external_turns=uses_external_turns,
             hold_numbers=elevenlabs_commits_manually(user_config),
         )
+        # Harkbell (-harkbell.38): a manually committed transcriber commits when
+        # the turn analyzer says the turn is over, not at every VAD stop, when the
+        # number-hold strategy is there to say so (``transcript_commit.py``).
+        if isinstance(stt, HarkbellElevenLabsRealtimeSTTService):
+            stt.defer_commits = any(
+                isinstance(strategy, NumberHoldTurnAnalyzerUserTurnStopStrategy)
+                for strategy in user_turn_stop_strategies
+            )
         # A keypress is a complete turn of its own, ahead of whatever word
         # threshold or turn analyzer the workflow configured.
         user_turn_strategies = with_keypad_turns(

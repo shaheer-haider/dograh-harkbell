@@ -19,6 +19,13 @@ what an early commit needs around it:
 - ``insufficient_audio_activity`` is a commit with no speech in it (the VAD
   fired on a noise). There is nothing to transcribe, so it is logged, not
   raised as an error.
+
+Since ``-harkbell.38`` the commit at a VAD stop also waits for the turn
+analyzer's word (``transcript_commit.py``), when ``defer_commits`` is on: a
+pause the analyzer judges unfinished is not committed, so the transcriber
+hears the sentence whole. A stop the analyzer does not answer within
+``VERDICT_WAIT_SECONDS`` is committed anyway, and a hold that is never
+released is committed after ``HOLD_LIMIT_SECONDS`` of silence.
 """
 
 import asyncio
@@ -27,11 +34,30 @@ import json
 from loguru import logger
 from websockets.protocol import State
 
+from pipecat.frames.frames import (
+    Frame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.elevenlabs.stt import CommitStrategy, ElevenLabsRealtimeSTTService
+
+from api.services.pipecat.transcript_commit import (
+    TranscriptCommitHoldFrame,
+    TranscriptCommitRequestFrame,
+)
 
 # How long to wait before sending a throttled commit again, and how many times.
 COMMIT_RETRY_SECONDS = 0.25
 COMMIT_RETRY_LIMIT = 3
+# How long a VAD stop waits for the turn analyzer's word before it is committed
+# anyway. The analyzer answers in tens of milliseconds; this is for a stop it
+# never sees (a muted turn, a frame dropped on the way).
+VERDICT_WAIT_SECONDS = 0.5
+# The longest silence a held commit waits through. The analyzer ends an
+# unfinished turn after its own 2 s and a part-read number after 1.5 s, so a
+# hold still standing after this was never going to be released.
+HOLD_LIMIT_SECONDS = 4.0
 
 
 class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
@@ -42,6 +68,62 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
         super().__init__(**kwargs)
         self._commit_retry_task: asyncio.Task | None = None
         self._commit_retries = 0
+        # Set by the pipeline when its stop strategy sends commit verdicts.
+        self.defer_commits = False
+        self._commit_timer: asyncio.Task | None = None
+        # Speech has been heard since the last commit.
+        self._uncommitted = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, TranscriptCommitRequestFrame):
+            await self._cancel_commit_timer()
+            await self._commit_heard()
+            return
+        if isinstance(frame, TranscriptCommitHoldFrame):
+            if self._uncommitted:
+                await self._arm_commit_timer(HOLD_LIMIT_SECONDS)
+            return
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            # The caller is speaking: whatever waited for a verdict is part of
+            # what they are saying now.
+            self._uncommitted = True
+            await self._cancel_commit_timer()
+        if self.defer_commits and isinstance(frame, VADUserStoppedSpeakingFrame):
+            # The ElevenLabs service would commit here. Its parent's handling
+            # stays; the commit waits for the turn analyzer.
+            await super(ElevenLabsRealtimeSTTService, self).process_frame(frame, direction)
+            self._uncommitted = True
+            await self._arm_commit_timer(VERDICT_WAIT_SECONDS)
+            return
+        await super().process_frame(frame, direction)
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._uncommitted = False
+
+    async def _commit_heard(self) -> None:
+        if not self._uncommitted:
+            return
+        self._uncommitted = False
+        await self._send_commit()
+
+    async def _arm_commit_timer(self, seconds: float) -> None:
+        await self._cancel_commit_timer()
+        self._commit_timer = self.create_task(
+            self._commit_after(seconds), f"{self}::commit_after"
+        )
+
+    async def _commit_after(self, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        self._commit_timer = None
+        logger.debug(f"{self}: committing after {seconds}s with no word from the turn analyzer")
+        await self._commit_heard()
+
+    async def _cancel_commit_timer(self) -> None:
+        if self._commit_timer:
+            await self.cancel_task(self._commit_timer)
+            self._commit_timer = None
 
     async def _send_commit(self) -> None:
         if not self._websocket or self._websocket.state is not State.OPEN:
@@ -98,4 +180,5 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
 
     async def _disconnect(self):
         await self._cancel_commit_retry()
+        await self._cancel_commit_timer()
         await super()._disconnect()

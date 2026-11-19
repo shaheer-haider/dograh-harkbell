@@ -290,3 +290,129 @@ def test_the_manual_service_commits_manually():
         sample_rate=16000,
     )
     assert service._commit_strategy == CommitStrategy.MANUAL
+
+
+async def _deferring_service(monkeypatch):
+    """The manual service with its commits recorded and its base frame handling stubbed."""
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+
+    from pipecat.clocks.system_clock import SystemClock
+    from pipecat.processors.frame_processor import FrameProcessorSetup
+    from pipecat.services.elevenlabs.stt import (
+        ElevenLabsRealtimeSTTService,
+        ElevenLabsRealtimeSTTSettings,
+    )
+    from pipecat.utils.asyncio.task_manager import TaskManager
+
+    from api.services.pipecat import elevenlabs_manual_stt
+    from api.services.pipecat.elevenlabs_manual_stt import (
+        HarkbellElevenLabsRealtimeSTTService,
+    )
+
+    passed: list = []
+
+    async def base_process_frame(self, frame, direction):
+        passed.append(type(frame).__name__)
+
+    # The parent of ElevenLabs' own service: what still runs on a deferred stop.
+    monkeypatch.setattr(ElevenLabsRealtimeSTTService.__mro__[1], "process_frame", base_process_frame)
+    monkeypatch.setattr(elevenlabs_manual_stt, "VERDICT_WAIT_SECONDS", 0.15)
+    monkeypatch.setattr(elevenlabs_manual_stt, "HOLD_LIMIT_SECONDS", 0.3)
+    service = HarkbellElevenLabsRealtimeSTTService(
+        api_key="k",
+        settings=ElevenLabsRealtimeSTTSettings(model="scribe_v3_live"),
+        sample_rate=16000,
+    )
+    service._connect = AsyncMock()
+    task_manager = TaskManager()
+    await service.setup(
+        FrameProcessorSetup(clock=SystemClock(), task_manager=task_manager, pipeline_worker=None)
+    )
+    commits: list[str] = []
+
+    async def send_commit():
+        commits.append("commit")
+
+    service._send_commit = send_commit
+    service.defer_commits = True
+    return service, commits, passed
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_stop_waits_for_the_turn_analyzer(monkeypatch):
+    import asyncio as _asyncio
+
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from api.services.pipecat.transcript_commit import TranscriptCommitRequestFrame
+
+    service, commits, passed = await _deferring_service(monkeypatch)
+    down, up = FrameDirection.DOWNSTREAM, FrameDirection.UPSTREAM
+    await service.process_frame(VADUserStartedSpeakingFrame(), down)
+    await service.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2), down)
+    # The stop still flows on; no commit until the analyzer says so.
+    assert passed[-1] == "VADUserStoppedSpeakingFrame"
+    assert commits == []
+    await service.process_frame(TranscriptCommitRequestFrame(), up)
+    assert commits == ["commit"]
+    # Asked again with nothing new heard: nothing to commit.
+    await service.process_frame(TranscriptCommitRequestFrame(), up)
+    assert commits == ["commit"]
+    await _asyncio.sleep(0.2)
+    assert commits == ["commit"]
+    await service.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_held_pause_is_not_committed_and_the_caller_speaking_again_keeps_it_open(monkeypatch):
+    import asyncio as _asyncio
+
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from api.services.pipecat.transcript_commit import (
+        TranscriptCommitHoldFrame,
+        TranscriptCommitRequestFrame,
+    )
+
+    service, commits, passed = await _deferring_service(monkeypatch)
+    down, up = FrameDirection.DOWNSTREAM, FrameDirection.UPSTREAM
+    await service.process_frame(VADUserStartedSpeakingFrame(), down)
+    await service.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2), down)
+    await service.process_frame(TranscriptCommitHoldFrame(), up)
+    await _asyncio.sleep(0.2)
+    assert commits == []
+    await service.process_frame(VADUserStartedSpeakingFrame(), down)
+    await _asyncio.sleep(0.2)
+    assert commits == []
+    await service.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2), down)
+    await service.process_frame(TranscriptCommitRequestFrame(), up)
+    assert commits == ["commit"]
+    await service.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_with_no_verdict_and_a_hold_never_released_are_committed_anyway(monkeypatch):
+    import asyncio as _asyncio
+
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from api.services.pipecat.transcript_commit import TranscriptCommitHoldFrame
+
+    service, commits, passed = await _deferring_service(monkeypatch)
+    down, up = FrameDirection.DOWNSTREAM, FrameDirection.UPSTREAM
+    await service.process_frame(VADUserStartedSpeakingFrame(), down)
+    await service.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2), down)
+    await _asyncio.sleep(0.25)
+    assert commits == ["commit"]
+    await service.process_frame(VADUserStartedSpeakingFrame(), down)
+    await service.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2), down)
+    await service.process_frame(TranscriptCommitHoldFrame(), up)
+    await _asyncio.sleep(0.2)
+    assert commits == ["commit"]
+    await _asyncio.sleep(0.2)
+    assert commits == ["commit", "commit"]
+    await service.cleanup()

@@ -15,6 +15,20 @@ speaking again cancels the hold, as it cancels any pending end of turn. A
 whole number ("seven three nine two zero five one six", "658744957") ends the
 turn at once, and so does a small number after a word that makes it a time
 ("at eight", "by 10").
+
+Since ``-harkbell.38``:
+
+- An order code with letters in it is held the same way until it has as many
+  characters as a whole number: "VS-441-B as in Bravo" is seven, and the "nine
+  two" a caller adds after a breath belongs to it (run 6573 read back and filed
+  VS441B for VS441B92). Letters count when the transcriber writes them as a
+  code -- a capital on its own, "B as in Bravo", "VS", "441B" -- and a turn
+  ending on "the NFL" or "row F" is not held: it has no digit and no spelling.
+- The strategy says when the transcriber commits (``transcript_commit.py``): a
+  hold at a pause the analyzer judges unfinished or that ends on part of a
+  number, a commit when the turn is over. The turn then ends on that commit's
+  own final, never on an earlier one. The number check reads the interim
+  transcript too, since nothing is final until the commit.
 """
 
 import asyncio
@@ -23,9 +37,21 @@ import time
 
 from loguru import logger
 
-from pipecat.frames.frames import TranscriptionFrame, VADUserStoppedSpeakingFrame
+from pipecat.frames.frames import (
+    Frame,
+    InterimTranscriptionFrame,
+    TranscriptionFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
+)
+
+from api.services.pipecat.transcript_commit import (
+    TranscriptCommitHoldFrame,
+    TranscriptCommitRequestFrame,
 )
 
 # The silence a caller gets, after a short run of digits, before the turn ends.
@@ -48,17 +74,84 @@ _NUMBER_CUES = frozenset(
     "is number order code reference ref case confirmation id".split()
 )
 _EDGE_PUNCTUATION = re.compile(r"^[^\w:]+|[^\w:]+$")
+# How long the final of a requested commit is waited for before the turn ends
+# on what it has. A commit with no speech in it has no final at all.
+COMMIT_FINAL_WAIT_SECS = 1.0
 
 
-def _tokens(text: str) -> list[str]:
+def _tokens(text: str, *, lower: bool = True) -> list[str]:
     # "658-744" and "6,587" are digits; "8:00" keeps its colon, so it reads as a time.
-    text = re.sub(r"(?<=\d)[,-](?=\d)", "", text.lower())
+    text = re.sub(r"(?<=\d)[,-](?=\d)", "", text.lower() if lower else text)
     text = text.replace("-", " ")
     return [t for t in (_EDGE_PUNCTUATION.sub("", raw) for raw in text.split()) if t]
 
 
+def _spelled_letter(token: str) -> bool:
+    """A letter on its own, as a transcriber writes one being spelled: "V", "B"."""
+    return len(token) == 1 and token.isalpha() and token.isupper() and token not in ("I", "A")
+
+
+def unfinished_code(text: str) -> bool | None:
+    """Whether a turn ends on an order code with letters in it, too short to be whole.
+
+    None when the run at the end has no letters: that is a number, and
+    ``unfinished_number`` judges it by its own rules.
+
+    Read from the end: spelled letters ("V S", "B as in Bravo"), capitals of
+    two or three ("VS"), letters and digits in one token ("441B"), digits and
+    digit words. The code is whole at ``WHOLE_NUMBER_DIGITS`` characters. A run
+    with no letters is left to ``unfinished_number``'s own rules; a run with
+    letters but no digit is held only when it is spelled, so "the NFL" and "row
+    F" end the turn.
+    """
+    tokens = _tokens(text, lower=False)
+    digits = letters = single_letters = 0
+    spelled = False
+    index = len(tokens) - 1
+    while index >= 0:
+        token = tokens[index]
+        low = token.lower()
+        if (
+            index >= 3
+            and token.isalpha()
+            and tokens[index - 1].lower() == "in"
+            and tokens[index - 2].lower() == "as"
+            and len(tokens[index - 3]) == 1
+            and tokens[index - 3].isalpha()
+        ):
+            # "B as in Bravo": one letter, said the way a code is spelled.
+            letters += 1
+            single_letters += 1
+            spelled = True
+            index -= 4
+            continue
+        if low.isdigit():
+            digits += len(low)
+        elif low in _DIGIT_WORDS:
+            digits += 1
+        elif _spelled_letter(token):
+            letters += 1
+            single_letters += 1
+        elif token.isalnum() and any(c.isdigit() for c in token) and any(c.isalpha() for c in token):
+            digits += sum(c.isdigit() for c in token)
+            letters += sum(c.isalpha() for c in token)
+        elif token.isalpha() and token.isupper() and 2 <= len(token) <= 3:
+            letters += len(token)
+        else:
+            break
+        index -= 1
+    if letters == 0:
+        return None
+    if digits + letters >= WHOLE_NUMBER_DIGITS:
+        return False
+    return digits > 0 or spelled or single_letters >= 2
+
+
 def unfinished_number(text: str) -> bool:
-    """Whether a turn ends on a run of digits too short to be a whole number."""
+    """Whether a turn ends on a run of digits, or an order code, too short to be whole."""
+    code = unfinished_code(text)
+    if code is not None:
+        return code
     tokens = _tokens(text)
     digits = 0
     first = len(tokens)
@@ -85,57 +178,114 @@ def unfinished_number(text: str) -> bool:
 
 
 class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrategy):
-    """The turn analyzer's stop strategy, holding the turn open on a part-read number."""
+    """The turn analyzer's stop strategy, holding the turn open on a part-read number.
 
-    def __init__(self, *, hold_secs: float = NUMBER_HOLD_SECS, **kwargs):
+    With ``steer_commits`` (the default) it also tells a manually committed
+    transcriber when to commit, and ends the turn on that commit's final.
+    """
+
+    def __init__(
+        self,
+        *,
+        hold_secs: float = NUMBER_HOLD_SECS,
+        steer_commits: bool = True,
+        final_wait_secs: float = COMMIT_FINAL_WAIT_SECS,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._hold_secs = hold_secs
+        self._steer_commits = steer_commits
+        self._final_wait_secs = final_wait_secs
         self._turn_text = ""
+        self._interim_text = ""
         self._speech_ended_at: float | None = None
         self._hold_task: asyncio.Task | None = None
         self._hold_expired = False
+        # This pause's commit has been asked for, and its final not yet seen.
+        self._commit_requested = False
+        self._awaiting_final = False
+        self._final_wait_task: asyncio.Task | None = None
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        if isinstance(frame, InterimTranscriptionFrame) and frame.text and frame.text.strip():
+            self._interim_text = frame.text.strip()
+        return await super().process_frame(frame)
 
     async def _reset(self):
         self._turn_text = ""
+        self._interim_text = ""
         await super()._reset()
 
     async def _discard_pending_end_of_turn(self):
         self._hold_expired = False
         self._speech_ended_at = None
-        if self._hold_task:
-            await self.task_manager.cancel_task(self._hold_task)
-            self._hold_task = None
+        self._commit_requested = False
+        self._awaiting_final = False
+        await self._cancel_task("_hold_task")
+        await self._cancel_task("_final_wait_task")
         await super()._discard_pending_end_of_turn()
 
     async def cleanup(self):
-        if self._hold_task:
-            await self.task_manager.cancel_task(self._hold_task)
-            self._hold_task = None
+        await self._cancel_task("_hold_task")
+        await self._cancel_task("_final_wait_task")
         await super().cleanup()
+
+    async def _cancel_task(self, name: str):
+        task = getattr(self, name)
+        if task:
+            setattr(self, name, None)
+            await self.task_manager.cancel_task(task)
 
     async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         # Set first: the parent ends by asking whether the turn may stop.
         self._speech_ended_at = frame.timestamp - frame.stop_secs
         await super()._handle_vad_user_stopped_speaking(frame)
+        if self._steer_commits and not self._turn_complete:
+            # The analyzer heard more coming: the transcriber keeps listening.
+            await self.push_frame(TranscriptCommitHoldFrame(), FrameDirection.UPSTREAM)
 
     async def _handle_transcription(self, frame: TranscriptionFrame):
         if frame.text and frame.text.strip():
             self._turn_text = f"{self._turn_text} {frame.text.strip()}".strip()
+        self._interim_text = ""
+        # A final nobody asked for is the transcriber committing on its own
+        # (no verdict reached it in time): that is this pause's commit.
+        self._commit_requested = True
+        if self._awaiting_final:
+            self._awaiting_final = False
+            await self._cancel_task("_final_wait_task")
         await super()._handle_transcription(frame)
 
+    def _heard(self) -> str:
+        return f"{self._turn_text} {self._interim_text}".strip()
+
     async def _maybe_trigger_user_turn_stopped(self):
-        if self._turn_complete and not self._hold_expired and unfinished_number(self._turn_text):
+        if self._turn_complete and not self._hold_expired and unfinished_number(self._heard()):
             ended = self._speech_ended_at if self._speech_ended_at is not None else time.time()
             remaining = ended + self._hold_secs - time.time()
             if remaining > 0:
                 if self._hold_task is None:
                     logger.debug(
                         f"{self}: holding the turn {remaining:.2f}s, it ends on part of a number: "
-                        f"{self._turn_text[-40:]!r}"
+                        f"{self._heard()[-40:]!r}"
                     )
                     self._hold_task = self.task_manager.create_task(
                         self._hold(remaining), f"{self}::number_hold"
                     )
+                    if self._steer_commits:
+                        await self.push_frame(TranscriptCommitHoldFrame(), FrameDirection.UPSTREAM)
+                return
+        if self._steer_commits and self._turn_complete:
+            if not self._commit_requested:
+                # The turn is over: the transcriber commits it, and the turn
+                # ends on that final rather than on one from earlier in it.
+                self._commit_requested = True
+                self._awaiting_final = True
+                await self.push_frame(TranscriptCommitRequestFrame(), FrameDirection.UPSTREAM)
+                self._final_wait_task = self.task_manager.create_task(
+                    self._wait_for_final(), f"{self}::commit_final"
+                )
+            if self._awaiting_final:
                 return
         await super()._maybe_trigger_user_turn_stopped()
 
@@ -147,4 +297,15 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         finally:
             self._hold_task = None
         self._hold_expired = True
+        await self._maybe_trigger_user_turn_stopped()
+
+    async def _wait_for_final(self):
+        try:
+            await asyncio.sleep(self._final_wait_secs)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._final_wait_task = None
+        # A commit with no speech in it has no final: end on what there is.
+        self._awaiting_final = False
         await self._maybe_trigger_user_turn_stopped()
