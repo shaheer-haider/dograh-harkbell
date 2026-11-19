@@ -50,6 +50,14 @@ EARLY_END_REFUSAL = (
     "Wait for the caller to speak."
 )
 
+# Harkbell: what an end-call tool answers while another tool's answer is still
+# unsaid (``_refuse_before_the_answer_is_said``). The model is run on it.
+UNSAID_ANSWER_REFUSAL = (
+    "Not yet. The caller has not heard what the last tool's answer gave you "
+    "for them. Say that now, as that answer words it, and nothing else. End "
+    "the call only once they have heard it."
+)
+
 
 def _message_text(message: Any) -> str:
     """The words in one context message, whatever shape it carries them in."""
@@ -529,9 +537,46 @@ class CustomToolManager:
         return mcp_tool_handler
 
     def _create_end_call_handler(self, tool: Any, function_name: str):
-        return self._refuse_before_anyone_speaks(
-            self._create_plain_end_call_handler(tool, function_name), function_name
-        )
+        handler = self._create_plain_end_call_handler(tool, function_name)
+        config = (getattr(tool, "definition", None) or {}).get("config", {}) or {}
+        if config.get("sayAnswerFirst"):
+            handler = self._refuse_before_the_answer_is_said(handler, function_name)
+        return self._refuse_before_anyone_speaks(handler, function_name)
+
+    def _refuse_before_the_answer_is_said(self, handler, function_name: str):
+        """An end-call tool that will not stand in for an outcome nobody heard.
+
+        Harkbell. "It's in two weeks. Okay, thanks, bye." -- the caller's last
+        detail and their goodbye in one breath. The routing tool answers with
+        what to tell them, the model reads a goodbye in the same turn, and it
+        ends the call: the caller leaves believing it is handled when they
+        were meant to email (suite runs 5054, 5099, 5164 and 5165 on the full
+        realtime model; copy runs 6159 and 6260 on the smaller one). Four
+        wordings did not hold -- the prompt's ending rule, this tool's
+        description, a required parameter on it, and the answer itself saying
+        "even if they have already said goodbye".
+
+        So where the tool asks for it (``sayAnswerFirst``): while another
+        tool's answer has gone to a realtime model and no audio has played
+        since (``tool_answer_unsaid``), the goodbye is refused and the model is
+        run again to say it. Once: the flag is cleared here, so a model that
+        insists ends the call on its second try rather than looping.
+        """
+
+        async def guarded(function_call_params: FunctionCallParams) -> None:
+            engine = getattr(self, "_engine", None)
+            agent = getattr(engine, "active_agent", None) if engine is not None else None
+            llm = getattr(agent, "llm", None)
+            if not getattr(llm, "tool_answer_unsaid", False):
+                await handler(function_call_params)
+                return
+            llm.tool_answer_unsaid = False
+            logger.warning(f"Refused {function_name}: the last tool's answer has not been said")
+            await function_call_params.result_callback(
+                {"status": "refused", "message": UNSAID_ANSWER_REFUSAL}
+            )
+
+        return guarded
 
     def _refuse_before_anyone_speaks(self, handler, function_name: str):
         """An end-call tool that cannot end a call the caller has not spoken on.

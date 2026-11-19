@@ -98,6 +98,11 @@ class DograhOpenAIRealtimeLLMService(
         # events themselves, in order, by response.
         self._held_commentary: dict[str, list] = {}
         self._commentary_items: set[str] = set()
+        # Harkbell (-harkbell.34): a tool's answer has gone to the model and
+        # the caller has heard nothing since. An end-call tool that asks for
+        # it reads this to refuse a goodbye in the outcome's place
+        # (``_refuse_before_the_answer_is_said``).
+        self.tool_answer_unsaid: bool = False
         super().__init__(**kwargs)
         # Track bot speech locally so workflow-control calls can wait until the
         # bot has finished speaking without delaying ordinary tools.
@@ -157,7 +162,24 @@ class DograhOpenAIRealtimeLLMService(
         return realtime_message
 
     async def _ws_send(self, realtime_message):
+        self._note_tool_answer(realtime_message)
         await super()._ws_send(self._with_transcription_keywords(realtime_message))
+
+    def _note_tool_answer(self, realtime_message) -> None:
+        """A tool's answer on its way to the model: the caller has not heard it.
+
+        Not an end-call tool's own answer, and not a refusal of one: neither
+        holds anything for the caller.
+        """
+        if not isinstance(realtime_message, dict):
+            return
+        item = realtime_message.get("item")
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            return
+        output = str(item.get("output") or "")
+        if "ending_call" in output or '"refused"' in output or "'refused'" in output:
+            return
+        self.tool_answer_unsaid = True
 
     async def push_frame(
         self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
@@ -613,6 +635,7 @@ class DograhOpenAIRealtimeLLMService(
             logger.info(f"{self}: commentary not played: {words!r}")
             return
         logger.info(f"{self}: a reply that was only commentary is played")
+        self.tool_answer_unsaid = False
         for evt in held:
             if evt.type == "response.output_audio.delta":
                 await super()._handle_evt_audio_delta(evt)
@@ -624,6 +647,8 @@ class DograhOpenAIRealtimeLLMService(
             return
         if self._holds_commentary(evt):
             return
+        # Audio the caller will hear: whatever a tool answered has a reply now.
+        self.tool_answer_unsaid = False
         await super()._handle_evt_audio_delta(evt)
 
     async def _handle_evt_audio_transcript_delta(self, evt):

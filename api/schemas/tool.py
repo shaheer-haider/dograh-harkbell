@@ -213,6 +213,14 @@ class EndCallConfig(BaseModel):
             "when endCallReason is enabled."
         ),
     )
+    sayAnswerFirst: bool = Field(
+        default=False,
+        description=(
+            "Harkbell. When enabled, the tool refuses once to end a call while "
+            "another tool's answer has gone to a realtime model and the caller "
+            "has heard nothing since: the model is sent back to say it."
+        ),
+    )
 
 
 class HttpTransferResolverConfig(BaseModel):
