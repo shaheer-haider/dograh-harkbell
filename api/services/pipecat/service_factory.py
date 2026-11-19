@@ -1512,6 +1512,8 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
         return DograhOpenAIRealtimeLLMService(
             api_key=api_key,
             transcription_keywords=transcription_keywords,
+            speak_commentary=getattr(realtime_config, "speak_commentary", None)
+            is not False,
             settings=DograhOpenAIRealtimeLLMService.Settings(
                 model=model,
                 session_properties=SessionProperties(

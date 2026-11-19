@@ -989,6 +989,17 @@ class OpenAIRealtimeLLMConfiguration(BaseLLMConfiguration):
         description="How fast the voice speaks (1.0 is the model's own pace).",
         json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
     )
+    # Harkbell (-harkbell.33): the model's spoken updates before a tool call
+    # or a longer think -- its "commentary" phase. Unset or true plays them,
+    # as the provider does; false plays only the answer.
+    speak_commentary: bool | None = Field(
+        default=None,
+        description=(
+            "Play the model's short spoken updates before a tool call or a "
+            "longer think. Off, the caller hears only the answer."
+        ),
+        json_schema_extra={"hidden_for_models": ["gpt-live-1"]},
+    )
     # Harkbell (-harkbell.28): the caller's transcript. The model hears the
     # audio itself; this is the side channel that writes down what was said,
     # which the run's record, extraction and the dashboard all read.

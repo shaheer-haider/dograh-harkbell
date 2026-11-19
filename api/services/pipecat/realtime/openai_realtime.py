@@ -91,6 +91,13 @@ class DograhOpenAIRealtimeLLMService(
         self._transcription_keywords: list[str] = list(
             kwargs.pop("transcription_keywords", None) or []
         )
+        # Harkbell (-harkbell.33): whether the model's commentary is played
+        # (``_holds_commentary``). True is the provider's own behaviour.
+        self._speak_commentary: bool = kwargs.pop("speak_commentary", True) is not False
+        # Commentary held back until its response says what it was: the
+        # events themselves, in order, by response.
+        self._held_commentary: dict[str, list] = {}
+        self._commentary_items: set[str] = set()
         super().__init__(**kwargs)
         # Track bot speech locally so workflow-control calls can wait until the
         # bot has finished speaking without delaying ordinary tools.
@@ -541,13 +548,88 @@ class DograhOpenAIRealtimeLLMService(
         if not self._disconnecting and self._api_session_ready:
             await self.send_client_event(events.ResponseCancelEvent())
 
+    async def _handle_evt_conversation_item_added(self, evt):
+        """Remember which of the model's messages are commentary.
+
+        Harkbell (-harkbell.33). The reasoning realtime models speak in two
+        phases: commentary -- "a short spoken update" before a tool call or a
+        longer think -- and the final answer, and each assistant message says
+        which it is. The provider's guide: "commentary can be played or
+        displayed as a short intermediate update, while final_answer can be
+        reserved for the assistant's completed response."
+
+        On the smaller model the commentary was what a caller should never
+        hear, and no wording kept it away: "Okay, thanks for confirming that;
+        let me think about what to do next" before a transfer (copy run 6105),
+        "Let me think this through with you for a moment" (6016), "Alright,
+        thanks for calling in. Just a quick question so we can get you to the
+        right path." in front of the greeting's answer (6002) -- in one call
+        in three, across six prompts. A line that sets ``speak_commentary``
+        false hears none of it.
+        """
+        item = evt.item
+        if (
+            not self._speak_commentary
+            and getattr(item, "role", None) == "assistant"
+            and getattr(item, "phase", None) == "commentary"
+        ):
+            self._commentary_items.add(item.id)
+        await super()._handle_evt_conversation_item_added(evt)
+
+    def _holds_commentary(self, evt) -> bool:
+        """Keep a commentary message's audio or words back, and say so.
+
+        Held, not dropped: a response that turns out to be nothing but
+        commentary -- no tool call, no final answer -- was the model's whole
+        reply under the wrong label, and is played when the response ends
+        (``_release_or_drop_commentary``) rather than leaving a silent line.
+        """
+        if getattr(evt, "item_id", None) not in self._commentary_items:
+            return False
+        self._held_commentary.setdefault(evt.response_id, []).append(evt)
+        return True
+
+    async def _release_or_drop_commentary(self, response) -> None:
+        held = self._held_commentary.pop(getattr(response, "id", None), None)
+        if not held:
+            return
+        output = list(getattr(response, "output", None) or [])
+        for item in output:
+            self._commentary_items.discard(getattr(item, "id", None))
+        said_or_did_more = any(
+            getattr(item, "type", None) == "function_call"
+            or (
+                getattr(item, "type", None) == "message"
+                and getattr(item, "phase", None) != "commentary"
+            )
+            for item in output
+        )
+        if said_or_did_more or getattr(response, "status", None) != "completed":
+            words = "".join(
+                evt.delta
+                for evt in held
+                if evt.type == "response.output_audio_transcript.delta" and evt.delta
+            )
+            logger.info(f"{self}: commentary not played: {words!r}")
+            return
+        logger.info(f"{self}: a reply that was only commentary is played")
+        for evt in held:
+            if evt.type == "response.output_audio.delta":
+                await super()._handle_evt_audio_delta(evt)
+            else:
+                await super()._handle_evt_audio_transcript_delta(evt)
+
     async def _handle_evt_audio_delta(self, evt):
         if self._conversation_closed:
+            return
+        if self._holds_commentary(evt):
             return
         await super()._handle_evt_audio_delta(evt)
 
     async def _handle_evt_audio_transcript_delta(self, evt):
         if self._conversation_closed:
+            return
+        if self._holds_commentary(evt):
             return
         await super()._handle_evt_audio_transcript_delta(evt)
 
@@ -598,6 +680,12 @@ class DograhOpenAIRealtimeLLMService(
         self._manual_response_start_pushed = False
         self._manual_response_outstanding = False
         self._note_response_outcome(evt.response)
+        # Before the response is closed: commentary that was the whole reply
+        # is played inside it, and the rest never reaches the caller.
+        if not self._conversation_closed:
+            await self._release_or_drop_commentary(evt.response)
+        else:
+            self._held_commentary.pop(evt.response.id, None)
         try:
             await super()._handle_evt_response_done(evt)
         finally:
