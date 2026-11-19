@@ -244,3 +244,49 @@ def test_elevenlabs_stt_configuration_bounds_the_commit_pause():
     )
     with pytest.raises(ValueError):
         ElevenlabsSTTConfiguration(api_key="k", vad_silence_threshold_secs=0.1)
+
+
+def test_elevenlabs_stt_commits_on_the_providers_timer_unless_told_otherwise():
+    assert ElevenlabsSTTConfiguration(api_key="k").commit_strategy == "vad"
+    assert (
+        ElevenlabsSTTConfiguration(api_key="k", commit_strategy="manual").commit_strategy
+        == "manual"
+    )
+    with pytest.raises(ValueError):
+        ElevenlabsSTTConfiguration(api_key="k", commit_strategy="sometimes")
+
+
+def test_elevenlabs_stt_on_manual_commits_uses_the_engines_vad_and_drops_the_pause():
+    # Mirror Labs copy, 2026-11-20: the provider's 0.7 s timer was 1.0 s of
+    # every reply; the engine's VAD hears the caller stop in 0.2 s.
+    user_config = _elevenlabs_config()
+    user_config.stt.commit_strategy = "manual"
+    user_config.stt.vad_silence_threshold_secs = 0.7
+
+    with patch(
+        "api.services.pipecat.service_factory.ElevenLabsRealtimeSTTSettings"
+    ) as settings, patch(
+        "api.services.pipecat.service_factory.HarkbellElevenLabsRealtimeSTTService"
+    ) as manual, patch(
+        "api.services.pipecat.service_factory.ElevenLabsRealtimeSTTService"
+    ) as timer:
+        create_stt_service(user_config, _audio_config())
+
+    manual.assert_called_once()
+    timer.assert_not_called()
+    assert "vad_silence_threshold_secs" not in settings.call_args.kwargs
+    assert "commit_strategy" not in manual.call_args.kwargs
+
+
+def test_the_manual_service_commits_manually():
+    from api.services.pipecat.elevenlabs_manual_stt import (
+        HarkbellElevenLabsRealtimeSTTService,
+    )
+    from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTSettings
+
+    service = HarkbellElevenLabsRealtimeSTTService(
+        api_key="k",
+        settings=ElevenLabsRealtimeSTTSettings(model="scribe_v3_live"),
+        sample_rate=16000,
+    )
+    assert service._commit_strategy == CommitStrategy.MANUAL

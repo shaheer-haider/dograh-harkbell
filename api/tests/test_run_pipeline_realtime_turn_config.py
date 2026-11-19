@@ -372,3 +372,28 @@ async def test_default_min_words_with_provider_turn_markers(
         UserStoppedSpeakingFrame,
     ):
         assert sum(isinstance(frame, frame_type) for frame in down) == int(accepted)
+
+
+def test_non_realtime_holds_numbers_when_the_transcriber_commits_on_vad(monkeypatch):
+    from api.services.pipecat.number_hold_turn_stop import (
+        NumberHoldTurnAnalyzerUserTurnStopStrategy,
+    )
+
+    monkeypatch.setattr(
+        run_pipeline_module,
+        "LocalSmartTurnAnalyzerV3",
+        lambda *, params: params,
+    )
+
+    held = _create_non_realtime_user_turn_stop_strategies(
+        {"turn_stop_strategy": "turn_analyzer"},
+        uses_external_turns=False,
+        hold_numbers=True,
+    )
+    plain = _create_non_realtime_user_turn_stop_strategies(
+        {"turn_stop_strategy": "turn_analyzer"},
+        uses_external_turns=False,
+    )
+
+    assert isinstance(held[0], NumberHoldTurnAnalyzerUserTurnStopStrategy)
+    assert type(plain[0]) is TurnAnalyzerUserTurnStopStrategy

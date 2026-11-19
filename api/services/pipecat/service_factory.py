@@ -31,6 +31,7 @@ from api.services.configuration.registry import (
 )
 from api.services.configuration.temperature import resolve_temperature
 from api.services.pipecat.assemblyai_stt import HarkbellAssemblyAISTTService
+from api.services.pipecat.elevenlabs_manual_stt import HarkbellElevenLabsRealtimeSTTService
 from api.services.pipecat.fallback_llm import FallbackLLMProcessor, FallbackRoute
 from api.services.pipecat.gemini_json_schema_adapter import (
     DograhGeminiJSONSchemaAdapter,
@@ -269,6 +270,15 @@ def _elevenlabs_realtime_stt_host(base_url: str) -> str:
         path = parsed.path
         return f"{parsed.netloc}{path}" if path else parsed.netloc
     return websocket_url
+
+
+def elevenlabs_commits_manually(user_config) -> bool:
+    """Harkbell: an ElevenLabs transcriber the engine's own VAD commits (registry.py)."""
+    stt = getattr(user_config, "stt", None)
+    return (
+        getattr(stt, "provider", None) == ServiceProviders.ELEVENLABS.value
+        and getattr(stt, "commit_strategy", "vad") == "manual"
+    )
 
 
 def stt_uses_external_turns(user_config) -> bool:
@@ -705,6 +715,19 @@ def create_stt_service(
             elevenlabs_settings["keyterms"] = [
                 term[:50] for term in keyterms[:ELEVENLABS_STT_MAX_KEYTERMS]
             ]
+
+        if elevenlabs_commits_manually(user_config):
+            # Harkbell: committed when the engine's own VAD hears the caller
+            # stop, not on the provider's silence timer, which it no longer
+            # reads (elevenlabs_manual_stt.py).
+            elevenlabs_settings.pop("vad_silence_threshold_secs", None)
+            return HarkbellElevenLabsRealtimeSTTService(
+                api_key=user_config.stt.api_key,
+                base_url=elevenlabs_host,
+                settings=ElevenLabsRealtimeSTTSettings(**elevenlabs_settings),
+                should_interrupt=False,
+                sample_rate=audio_config.transport_in_sample_rate,
+            )
 
         return ElevenLabsRealtimeSTTService(
             api_key=user_config.stt.api_key,

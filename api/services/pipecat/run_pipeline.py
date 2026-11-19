@@ -44,6 +44,9 @@ from api.services.pipecat.event_handlers import (
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
 from api.services.pipecat.keypad import bind_realtime_keypad, with_keypad_turns
+from api.services.pipecat.number_hold_turn_stop import (
+    NumberHoldTurnAnalyzerUserTurnStopStrategy,
+)
 from api.services.pipecat.phrase_turn_start import (
     create_turn_start_strategy,
     resolve_turn_start_phrases,
@@ -73,6 +76,7 @@ from api.services.pipecat.service_factory import (
     create_llm_service_from_provider,
     create_realtime_llm_service,
     create_stt_service,
+    elevenlabs_commits_manually,
     get_llm_runtime_configuration,
     stt_uses_external_turns,
 )
@@ -262,9 +266,15 @@ def _create_non_realtime_user_turn_start_strategies(
 
 
 def _create_non_realtime_user_turn_stop_strategies(
-    run_configs: dict, *, uses_external_turns: bool
+    run_configs: dict, *, uses_external_turns: bool, hold_numbers: bool = False
 ):
-    """Return user turn stop strategies for non-realtime pipelines."""
+    """Return user turn stop strategies for non-realtime pipelines.
+
+    ``hold_numbers`` (Harkbell): the transcriber commits on the engine's own
+    0.2 s VAD (``elevenlabs_commits_manually``), so every pause reaches the
+    turn analyzer, and a turn that ends on part of a number is held open
+    (``number_hold_turn_stop.py``).
+    """
 
     if uses_external_turns:
         return [ExternalUserTurnStopStrategy()]
@@ -275,10 +285,13 @@ def _create_non_realtime_user_turn_stop_strategies(
                 "smart_turn_stop_secs", DEFAULT_SMART_TURN_STOP_SECS
             )
         )
+        strategy = (
+            NumberHoldTurnAnalyzerUserTurnStopStrategy
+            if hold_numbers
+            else TurnAnalyzerUserTurnStopStrategy
+        )
         return [
-            TurnAnalyzerUserTurnStopStrategy(
-                turn_analyzer=LocalSmartTurnAnalyzerV3(params=smart_turn_params)
-            )
+            strategy(turn_analyzer=LocalSmartTurnAnalyzerV3(params=smart_turn_params))
         ]
 
     return [SpeechTimeoutUserTurnStopStrategy()]
@@ -1026,6 +1039,7 @@ async def _run_pipeline_impl(
         user_turn_stop_strategies = _create_non_realtime_user_turn_stop_strategies(
             run_configs,
             uses_external_turns=uses_external_turns,
+            hold_numbers=elevenlabs_commits_manually(user_config),
         )
         # A keypress is a complete turn of its own, ahead of whatever word
         # threshold or turn analyzer the workflow configured.

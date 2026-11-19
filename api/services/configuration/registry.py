@@ -2478,6 +2478,19 @@ class ElevenlabsSTTConfiguration(BaseSTTConfiguration):
             "and 'Vivid Seats' 'Vivid Seed' (copy runs 6506, 6508)."
         ),
     )
+    commit_strategy: Literal["vad", "manual"] = Field(
+        default="vad",
+        description=(
+            "Who decides that the caller has finished a stretch of speech. "
+            "'vad' (the default) is the provider's own silence timer "
+            "(vad_silence_threshold_secs). 'manual' commits the moment the "
+            "engine's own voice detector hears the caller stop (0.2 s), and "
+            "holds the turn open while a short run of digits may still be "
+            "going on. On the Mirror Labs copy the provider's timer cost 1.0 s "
+            "at a 0.7 s pause and cut a slowly read order number apart "
+            "(2026-11-19/20, runs 6537, 6543-6545)."
+        ),
+    )
 
 
 @register_stt(provider=SMALLEST_PROVIDER)
