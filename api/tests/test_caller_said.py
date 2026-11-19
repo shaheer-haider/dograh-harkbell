@@ -79,3 +79,38 @@ def test_only_the_last_turns_are_kept():
     engine.note_caller_turn("word " * 400 + "six five eight seven")
     assert len(engine._gathered_context["caller_said"]) <= PipecatEngine.CALLER_SAID_CHARS
     assert engine._gathered_context["caller_said"].endswith("six five eight seven")
+
+
+def test_how_they_opened_the_call_outlives_the_last_turns():
+    # Harkbell (-harkbell.35): "Hi, Gametime support" is said once.
+    engine = _engine()
+    engine.note_caller_turn("[keypad] 1")
+    assert "caller_opened" not in engine._gathered_context
+    engine.note_caller_turn("Hi, Gametime support, can you hold on one second?")
+    for n in range(20):
+        engine.note_caller_turn(f"turn {n}")
+    assert engine._gathered_context["caller_opened"] == (
+        "Hi, Gametime support, can you hold on one second?"
+    )
+    assert "Gametime" not in engine._gathered_context["caller_said"]
+
+
+def test_the_agents_own_words_reach_a_tool_beside_the_callers():
+    # Run 6278: read back right, agreed to, then typed with a digit dropped.
+    engine = _engine()
+    assert "agent_said" not in engine._gathered_context
+    engine.note_agent_turn("Hi — go ahead. What's the order number?")
+    engine.note_agent_turn("  Six, five, eight, seven, four, four,   nine, five, seven? ")
+    engine.note_agent_turn("")
+    engine.note_agent_turn(None)
+    assert engine._gathered_context["agent_said"] == (
+        "Hi — go ahead. What's the order number?"
+        " | Six, five, eight, seven, four, four, nine, five, seven?"
+    )
+    for n in range(20):
+        engine.note_agent_turn(f"reply {n}")
+    said = engine._gathered_context["agent_said"].split(" | ")
+    assert said == [f"reply {n}" for n in range(14, 20)]
+    engine.note_agent_turn("word " * 400 + "six five eight seven")
+    assert len(engine._gathered_context["agent_said"]) <= PipecatEngine.AGENT_SAID_CHARS
+

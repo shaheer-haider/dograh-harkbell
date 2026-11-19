@@ -1325,6 +1325,14 @@ async def _run_pipeline_impl(
         except Exception as e:
             logger.error(f"Failed to keep the caller's turn for tools: {e}")
 
+    # Harkbell: and the agent's own, as spoken (``PipecatEngine.note_agent_turn``).
+    @assistant_context_aggregator.event_handler("on_assistant_turn_stopped")
+    async def _note_agent_turn(aggregator, message):
+        try:
+            engine.note_agent_turn(message.content)
+        except Exception as e:
+            logger.error(f"Failed to keep the agent's turn for tools: {e}")
+
     # Register event handlers — resolve provider_id for PostHog tracking
     if not user_provider_id:
         user_obj = await db_client.get_user_by_id(user_id)

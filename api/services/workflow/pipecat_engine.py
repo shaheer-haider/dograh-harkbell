@@ -213,6 +213,8 @@ class PipecatEngine:
         self._gathered_context: dict = {}
         # The caller's last turns as transcribed (``note_caller_turn``).
         self._caller_turns: list[str] = []
+        # The agent's last turns as spoken (``note_agent_turn``).
+        self._agent_turns: list[str] = []
         self._response_timeout_task: Optional[asyncio.Task] = None
         self._pending_extraction_tasks: set[asyncio.Task] = set()
         # True once terminal call disposal has run its synchronous extraction.
@@ -2346,6 +2348,7 @@ class PipecatEngine:
     # which is where an order number and its correction are.
     CALLER_SAID_TURNS = 8
     CALLER_SAID_CHARS = 900
+    CALLER_OPENED_CHARS = 240
 
     def note_caller_turn(self, text) -> None:
         """Keep the caller's last turns, as transcribed, where a tool can read them.
@@ -2365,10 +2368,41 @@ class PipecatEngine:
         words = " ".join(str(text or "").split())
         if not words or words.startswith("[keypad]"):
             return
+        # How they opened the call is kept for good (-harkbell.35): who they
+        # are with is said once, in the first sentence, and on a long call it
+        # has left the last eight turns by the time a tool asks.
+        self._gathered_context.setdefault(
+            "caller_opened", words[: self.CALLER_OPENED_CHARS]
+        )
         self._caller_turns.append(words)
         del self._caller_turns[: -self.CALLER_SAID_TURNS]
         self._gathered_context["caller_said"] = " | ".join(self._caller_turns)[
             -self.CALLER_SAID_CHARS :
+        ]
+
+    AGENT_SAID_TURNS = 6
+    AGENT_SAID_CHARS = 900
+
+    def note_agent_turn(self, text) -> None:
+        """Keep the agent's last turns, as spoken, where a tool can read them.
+
+        Harkbell. A realtime model says one thing and types another: on the
+        Mirror Labs copy (run 6278, 2026-11-19) it read a nine-digit order
+        number back right, heard the caller's yes, and sent the routing tool
+        that number with a digit dropped. The tool held it to the caller's
+        words and read the number back again -- a third time -- to a caller
+        who had already agreed to it. With the agent's own words beside the
+        caller's (``agent_said``, turns joined by " | ", oldest first), a tool
+        can see that what was read back and agreed to is what the caller said,
+        and take that number without asking again.
+        """
+        words = " ".join(str(text or "").split())
+        if not words:
+            return
+        self._agent_turns.append(words)
+        del self._agent_turns[: -self.AGENT_SAID_TURNS]
+        self._gathered_context["agent_said"] = " | ".join(self._agent_turns)[
+            -self.AGENT_SAID_CHARS :
         ]
 
     def set_mute_pipeline(self, mute: bool) -> None:
