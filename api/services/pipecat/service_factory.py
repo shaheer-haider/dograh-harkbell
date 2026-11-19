@@ -364,6 +364,10 @@ def _google_vertex_location(location: str | None, service: str) -> str:
     return GOOGLE_VERTEX_DEFAULT_LOCATION
 
 
+# How many of a workflow's dictionary terms go to ElevenLabs' transcriber.
+ELEVENLABS_STT_MAX_KEYTERMS = 100
+
+
 @_report_service_factory_failures(ErrorSource.STT, config_section="stt")
 def create_stt_service(
     user_config,
@@ -687,14 +691,26 @@ def create_stt_service(
         _validate_runtime_service_url(user_config.stt.base_url, "base_url")
         elevenlabs_host = _elevenlabs_realtime_stt_host(user_config.stt.base_url)
 
+        # Harkbell: the commit pause and the workflow's dictionary, each only
+        # when the configuration asks for it (registry.py). The word list
+        # rides the socket's URL, so it is held to what a URL carries.
+        elevenlabs_settings = {
+            "model": user_config.stt.model,
+            "language": pipecat_language,
+        }
+        commit_pause = getattr(user_config.stt, "vad_silence_threshold_secs", None)
+        if commit_pause is not None:
+            elevenlabs_settings["vad_silence_threshold_secs"] = float(commit_pause)
+        if keyterms and getattr(user_config.stt, "keyterms_from_dictionary", False):
+            elevenlabs_settings["keyterms"] = [
+                term[:50] for term in keyterms[:ELEVENLABS_STT_MAX_KEYTERMS]
+            ]
+
         return ElevenLabsRealtimeSTTService(
             api_key=user_config.stt.api_key,
             base_url=elevenlabs_host,
             commit_strategy=CommitStrategy.VAD,
-            settings=ElevenLabsRealtimeSTTSettings(
-                model=user_config.stt.model,
-                language=pipecat_language,
-            ),
+            settings=ElevenLabsRealtimeSTTSettings(**elevenlabs_settings),
             should_interrupt=False,
             sample_rate=audio_config.transport_in_sample_rate,
         )

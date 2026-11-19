@@ -2457,6 +2457,27 @@ class ElevenlabsSTTConfiguration(BaseSTTConfiguration):
             "regional compliance."
         ),
     )
+    # Harkbell. Both unset keep the service exactly as it was.
+    vad_silence_threshold_secs: float | None = Field(
+        default=None,
+        ge=0.3,
+        le=3.0,
+        description=(
+            "Seconds of silence before the transcriber commits what it heard "
+            "(0.3-3.0). Unset leaves the provider's own, which held a slowly "
+            "read order number in one piece and made every reply about 1.3 s "
+            "slower than AssemblyAI's (Mirror Labs copy, 2026-11-19: 1.91 s "
+            "against 0.56 s from the caller's last word to the transcript)."
+        ),
+    )
+    keyterms_from_dictionary: bool = Field(
+        default=False,
+        description=(
+            "Send the workflow's dictionary to the transcriber as key terms. "
+            "Off, it hears with no word list: 'SeatGeek' came back 'Seed Geek' "
+            "and 'Vivid Seats' 'Vivid Seed' (copy runs 6506, 6508)."
+        ),
+    )
 
 
 @register_stt(provider=SMALLEST_PROVIDER)

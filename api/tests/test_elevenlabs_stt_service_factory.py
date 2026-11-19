@@ -196,3 +196,51 @@ def test_elevenlabs_stt_listed_custom_language_maps_to_pipecat_enum():
 
     kwargs = stt_service.call_args.kwargs
     assert kwargs["settings"].language == Language.YUE
+
+
+def test_elevenlabs_stt_sends_no_pause_or_word_list_unless_configured():
+    user_config = _elevenlabs_config()
+
+    with patch(
+        "api.services.pipecat.service_factory.ElevenLabsRealtimeSTTSettings"
+    ) as settings, patch(
+        "api.services.pipecat.service_factory.ElevenLabsRealtimeSTTService"
+    ):
+        create_stt_service(
+            user_config, _audio_config(), keyterms=["SeatGeek", "Vivid Seats"]
+        )
+
+    assert set(settings.call_args.kwargs) == {"model", "language"}
+
+
+def test_elevenlabs_stt_takes_the_commit_pause_and_the_dictionary_when_asked():
+    # Mirror Labs copy, 2026-11-19: the provider's own pause made each reply
+    # about 1.3 s slower, and with no word list "SeatGeek" was "Seed Geek".
+    user_config = _elevenlabs_config()
+    user_config.stt.vad_silence_threshold_secs = 0.8
+    user_config.stt.keyterms_from_dictionary = True
+    terms = [f"term {index}" for index in range(140)] + ["x" * 80]
+
+    with patch(
+        "api.services.pipecat.service_factory.ElevenLabsRealtimeSTTSettings"
+    ) as settings, patch(
+        "api.services.pipecat.service_factory.ElevenLabsRealtimeSTTService"
+    ):
+        create_stt_service(user_config, _audio_config(), keyterms=terms)
+
+    kwargs = settings.call_args.kwargs
+    assert kwargs["vad_silence_threshold_secs"] == 0.8
+    assert len(kwargs["keyterms"]) == 100
+    assert all(len(term) <= 50 for term in kwargs["keyterms"])
+
+
+def test_elevenlabs_stt_configuration_bounds_the_commit_pause():
+    assert ElevenlabsSTTConfiguration(api_key="k").vad_silence_threshold_secs is None
+    assert (
+        ElevenlabsSTTConfiguration(
+            api_key="k", vad_silence_threshold_secs=0.8
+        ).vad_silence_threshold_secs
+        == 0.8
+    )
+    with pytest.raises(ValueError):
+        ElevenlabsSTTConfiguration(api_key="k", vad_silence_threshold_secs=0.1)
