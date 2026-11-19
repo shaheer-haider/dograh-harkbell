@@ -11,13 +11,19 @@ turn exactly as before.
   is dropped the way a sub-threshold transcript is today.
 - A transcript carrying a break-in phrase ("stop", "hold on", "actually")
   starts the turn at once, whatever the count.
-- Anything else is judged by the word count.
+- A transcript that carries a number ("44957", "3", "seven three nine")
+  starts the turn at once: a caller reading an order number is never a
+  back-channel, and a transcriber writes the digits as one token, which a
+  word count reads as one word.
+- Anything else is judged by the word count, kept across the short finals a
+  transcriber cuts one sentence into ("Hi," then "StubHub support.").
 
 Both sides are normalised the same way — lower-cased, hyphens to spaces,
 punctuation stripped — so "Mm-hmm." and "mm hmm" are the same phrase.
 """
 
 import re
+import time
 
 from loguru import logger
 
@@ -27,6 +33,31 @@ from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 
 _SEPARATORS = re.compile(r"[-_/]+")
 _NOT_WORD = re.compile(r"[^\w\s]+")
+
+
+_DIGIT_WORDS = frozenset(
+    "zero oh one two three four five six seven eight nine".split()
+)
+# How long a short final still counts towards the next one's word count.
+_CARRY_SECONDS = 3.0
+
+
+def carries_a_number(tokens: list[str]) -> bool:
+    """Whether a transcript is a number being read out.
+
+    Harkbell. On the Mirror Labs copy (2026-11-19, pipeline runs 6469, 6470,
+    6480, 6481) an order number said in two breaths, or slowly while typing,
+    lost every digit that landed on the agent's speech: the transcriber
+    writes "four four nine five seven" as "44957." -- one token, under a
+    three-word threshold -- and each slow digit as its own final ("3.", "9.").
+    The agent read back and filed "6587" for 658744957 and "73916" for
+    73920516. A token with a digit in it is a number; so is a transcript made
+    of nothing but digit words. "one" on its own stays a word ("one second" is
+    a break-in phrase of its own).
+    """
+    if any(any(ch.isdigit() for ch in token) for token in tokens):
+        return True
+    return len(tokens) >= 2 and all(token in _DIGIT_WORDS for token in tokens)
 
 
 def normalize_transcript(text: str) -> str:
@@ -96,6 +127,14 @@ class PhraseAwareUserTurnStartStrategy(MinWordsUserTurnStartStrategy):
         super().__init__(min_words=min_words, **kwargs)
         self._ignore = PhraseList(ignore_phrases)
         self._break_in = PhraseList(break_in_phrases)
+        # Words of the finals that fell short while the bot was speaking, and
+        # when the last of them arrived (see _handle_transcription).
+        self._carried_words = 0
+        self._carried_at = 0.0
+
+    async def handle_user_turn_started(self):
+        self._carried_words = 0
+        await super().handle_user_turn_started()
 
     async def _handle_transcription(
         self, frame: TranscriptionFrame | InterimTranscriptionFrame
@@ -119,6 +158,34 @@ class PhraseAwareUserTurnStartStrategy(MinWordsUserTurnStartStrategy):
             )
             await self.trigger_user_turn_started()
             return ProcessFrameResult.STOP
+        if carries_a_number(tokens):
+            logger.debug(
+                f"{self} number in {frame.text!r} while bot speaking "
+                f"interim_transcription={is_interim}"
+            )
+            await self.trigger_user_turn_started()
+            return ProcessFrameResult.STOP
+        # A transcriber cuts one sentence into short finals, and each was
+        # counted alone: "Hi," (one word) and "StubHub support." (two) both
+        # fell under a threshold of three, so a caller's first sentence, said
+        # as the greeting ended, was dropped whole (copy runs 6472, 6483) and
+        # the line sat silent until the idle prompt. Finals that arrive within
+        # a few seconds of each other are one sentence: their words add up.
+        # Interims are left out -- each repeats the one before it.
+        if not is_interim and tokens:
+            now = time.monotonic()
+            if now - self._carried_at > _CARRY_SECONDS:
+                self._carried_words = 0
+            self._carried_at = now
+            if self._carried_words + len(tokens) >= self._min_words > len(tokens):
+                logger.debug(
+                    f"{self} {frame.text!r} completes {self._carried_words} carried "
+                    f"words while bot speaking"
+                )
+                self._carried_words = 0
+                await self.trigger_user_turn_started()
+                return ProcessFrameResult.STOP
+            self._carried_words += len(tokens)
         return await super()._handle_transcription(frame)
 
 

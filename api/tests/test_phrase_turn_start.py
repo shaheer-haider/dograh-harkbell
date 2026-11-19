@@ -27,6 +27,7 @@ from api.services.pipecat.greeting import GreetingController
 from api.services.pipecat.phrase_turn_start import (
     PhraseAwareUserTurnStartStrategy,
     PhraseList,
+    carries_a_number,
     create_turn_start_strategy,
     normalize_phrases,
     normalize_transcript,
@@ -172,6 +173,67 @@ async def test_mixed_transcript_with_a_break_in_word_interrupts_even_with_back_c
         is ProcessFrameResult.STOP
     )
     assert seen.starts == 1
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("44957.", True),
+        ("3.", True),
+        ("The order number is 7.", True),
+        ("seven three nine", True),
+        ("oh five one six", True),
+        ("one", False),
+        ("yeah but", False),
+        ("StubHub support.", False),
+    ],
+)
+def test_carries_a_number(text, expected):
+    assert carries_a_number(normalize_transcript(text).split()) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["44957.", "3.", "seven three"])
+async def test_a_number_read_over_the_bot_starts_the_turn_below_the_word_count(text):
+    # Copy runs 6469 and 6470: the second half of an order number, and each
+    # slow digit, arrived as one token while the agent was speaking.
+    strategy, seen = strategy_with(min_words=3)
+    await strategy.process_frame(BotStartedSpeakingFrame())
+    assert await strategy.process_frame(transcript(text)) is ProcessFrameResult.STOP
+    assert seen.starts == 1
+    assert seen.resets == 0
+
+
+@pytest.mark.asyncio
+async def test_short_finals_of_one_sentence_add_up_while_the_bot_speaks():
+    # Copy runs 6472 and 6483: "Hi," then "StubHub support." were each under
+    # three words, and the caller's first sentence was dropped whole.
+    strategy, seen = strategy_with(min_words=3)
+    await strategy.process_frame(BotStartedSpeakingFrame())
+    assert await strategy.process_frame(transcript("Hi,")) is ProcessFrameResult.CONTINUE
+    assert seen.starts == 0
+    assert (
+        await strategy.process_frame(transcript("StubHub support."))
+        is ProcessFrameResult.STOP
+    )
+    assert seen.starts == 1
+
+
+@pytest.mark.asyncio
+async def test_interims_and_back_channels_do_not_add_up():
+    strategy, seen = strategy_with(min_words=3)
+    await strategy.process_frame(BotStartedSpeakingFrame())
+    for _ in range(3):
+        assert (
+            await strategy.process_frame(transcript("yeah but", interim=True))
+            is ProcessFrameResult.CONTINUE
+        )
+    for _ in range(3):
+        assert (
+            await strategy.process_frame(transcript("Mm-hmm."))
+            is ProcessFrameResult.CONTINUE
+        )
+    assert seen.starts == 0
 
 
 @pytest.mark.asyncio
