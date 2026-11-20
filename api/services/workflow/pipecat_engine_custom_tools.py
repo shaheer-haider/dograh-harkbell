@@ -59,6 +59,24 @@ UNSAID_ANSWER_REFUSAL = (
 )
 
 
+# Harkbell: the longest the hold tone waits for the transfer sentence to finish.
+HOLD_MUSIC_SENTENCE_WAIT_SECS = 10.0
+
+
+async def wait_for_sentence_then(speech, stop_event: asyncio.Event, limit: float) -> None:
+    """Wait until ``speech`` has played, ``stop_event`` is set or ``limit`` passes."""
+    if speech is None or getattr(speech, "done", False) or not hasattr(speech, "wait"):
+        return
+    sentence = asyncio.ensure_future(speech.wait())
+    stopped = asyncio.ensure_future(stop_event.wait())
+    try:
+        await asyncio.wait({sentence, stopped}, timeout=limit, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (sentence, stopped):
+            if not task.done():
+                task.cancel()
+
+
 def _message_text(message: Any) -> str:
     """The words in one context message, whatever shape it carries them in."""
     if not isinstance(message, dict):
@@ -1179,14 +1197,28 @@ class CustomToolManager:
                         f"Starting hold music at {sample_rate}Hz while waiting for transfer"
                     )
 
-                    # Start hold music as background task
-                    hold_music_task = asyncio.create_task(
-                        play_audio_loop(
+                    # Harkbell: the hold tone waits for the transfer sentence.
+                    # It used to start the moment the dial went out, so a
+                    # caller heard "I'm putting you through to the team now —
+                    # please hold." with the tone already playing over it
+                    # (copy runs 6990, 6992, 2026-11-20). The dial and the
+                    # completion wait below are not held up: only the tone.
+                    async def hold_music_after_sentence():
+                        await wait_for_sentence_then(
+                            speech,
+                            hold_music_stop_event,
+                            HOLD_MUSIC_SENTENCE_WAIT_SECS,
+                        )
+                        if hold_music_stop_event.is_set():
+                            return
+                        await play_audio_loop(
                             stop_event=hold_music_stop_event,
                             sample_rate=sample_rate,
                             queue_frame=self._engine._transport_output.queue_frame,
                         )
-                    )
+
+                    # Start hold music as background task
+                    hold_music_task = asyncio.create_task(hold_music_after_sentence())
 
                     # Wait for transfer completion using Redis pub/sub
                     logger.info("Waiting for transfer completion via Redis pub/sub...")

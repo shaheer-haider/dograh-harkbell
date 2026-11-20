@@ -118,3 +118,43 @@ async def test_a_caller_the_vad_hears_is_committed_once():
     result = await _call(frames, words)
     assert len(result["turns"]) == 1, f"{result}"
     assert [c for c in result["commits"] if c] == [" ".join(words)], f"{result}"
+
+
+@pytest.mark.asyncio
+async def test_a_pause_after_a_dash_keeps_the_sentence_in_one_turn():
+    # Copy run 6986: "Sorry, the order ID I said- / Is wrong" became two turns
+    # under a flat one-second wait, and each was answered.
+    words = ["Sorry,", "the", "order", "I", "said-", "is", "wrong."]
+    frames = [*_paced(_silence(0.4))]
+    for i in range(5):
+        frames += _paced(_quiet_speech(i, 0.3))
+    frames += _paced(_silence(1.4))
+    for i in range(5, 7):
+        frames += _paced(_quiet_speech(i, 0.3))
+    frames += _paced(_silence(6.0))
+    result = await _call(frames, words)
+    assert len(result["turns"]) == 1, f"the pause split the sentence: {result}"
+    assert all(w in _heard(result) for w in words), f"words were lost: {result}"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_short_answer_is_committed_quickly():
+    # Copy run 6986: "Yeah." waited the full second like any other word.
+    words = ["Yeah."]
+    frames = [*_paced(_silence(0.4)), *_paced(_quiet_speech(0, 0.4)), *_paced(_silence(6.0))]
+    result = await _call(frames, words)
+    assert result["turns"], f"the turn never ended: {result}"
+    assert "Yeah." in _heard(result)
+    assert result["turns"][-1][0] <= 1.5, f"the turn ended late: {result}"
+
+
+def test_the_wait_reads_how_the_words_end():
+    from api.services.pipecat.elevenlabs_manual_stt import words_quiet_seconds as wait
+
+    assert wait("Yeah.") < 1.0
+    assert wait("Is this Domino's Pizza?") < 1.0
+    assert wait("Sorry, the order ID I said-") >= 2.0
+    assert wait("Uh, I'm calling about an") >= 2.0
+    assert wait("Hello, um") >= 2.0
+    assert wait("Five, five, one, two") >= 2.0
+    assert wait("Order 64417208.") < 1.0

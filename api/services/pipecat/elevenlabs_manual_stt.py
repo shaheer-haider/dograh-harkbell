@@ -34,8 +34,9 @@ its 0.7 bar and never reported the caller speaking, so no commit was ever sent:
 "Hello? Hello?" waited 19 s, and a sentence said after a short VAD blip was
 never answered. A partial transcript with new words while the VAD is not
 reporting speech now arms a timer, and once the words have stopped changing for
-``WORDS_QUIET_SECONDS`` (``WORDS_NUMBER_QUIET_SECONDS`` when they end on a
-part-read number) the turn is committed. A caller the VAD hears never reaches
+``words_quiet_seconds`` (0.7 s after a finished sentence, 2.0 s after a dash,
+a comma, a filler or a part-read number, 1.0 s otherwise) the turn is
+committed. A caller the VAD hears never reaches
 it: partials during VAD speech arm nothing, and every commit cancels it.
 """
 
@@ -77,6 +78,36 @@ WORDS_QUIET_SECONDS = 1.0
 # The same when the words end on a run of digits too short to be a whole order
 # number: a caller reading one off a screen pauses between digits.
 WORDS_NUMBER_QUIET_SECONDS = 2.0
+# Since -harkbell.42 the wait reads how the words end. On the operator's calls
+# (copy runs 6986-6990, 2026-11-20) one flat second cut "Sorry, the order ID I
+# said- / Is wrong" into two turns, each answered ("Go on", "No problem"), and a
+# finished "Yeah." still waited the full second. A sentence that has ended is
+# committed sooner; one that stops on a dash, a comma, a filler or a joining
+# word waits as long as a part-read number.
+WORDS_FINISHED_QUIET_SECONDS = 0.7
+WORDS_UNFINISHED_QUIET_SECONDS = 2.0
+_CONTINUING_WORDS = frozenset(
+    "uh um er erm hmm and so but or because the a an is are was to of about with "
+    "my your our their his her that this from for in on at if i i'm it's it "
+    "order number like just".split()
+)
+
+
+def words_quiet_seconds(text: str) -> float:
+    """How long the transcriber's words must stop changing before they are committed."""
+    text = text.strip()
+    if not text:
+        return WORDS_QUIET_SECONDS
+    if unfinished_number(text):
+        return WORDS_NUMBER_QUIET_SECONDS
+    if text[-1] in "-\u2014\u2013,:;" or text.endswith(("...", "\u2026")):
+        return WORDS_UNFINISHED_QUIET_SECONDS
+    last = text.rstrip(".?!").split()[-1].lower().strip(",") if text.rstrip(".?!").split() else ""
+    if text[-1] not in ".?!" and last in _CONTINUING_WORDS:
+        return WORDS_UNFINISHED_QUIET_SECONDS
+    if text[-1] in ".?!":
+        return WORDS_FINISHED_QUIET_SECONDS
+    return WORDS_QUIET_SECONDS
 
 
 class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
@@ -144,7 +175,7 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
             return
         self._uncommitted = True
         await self._cancel_words_timer()
-        quiet = WORDS_NUMBER_QUIET_SECONDS if unfinished_number(text) else WORDS_QUIET_SECONDS
+        quiet = words_quiet_seconds(text)
         self._words_timer = self.create_task(
             self._commit_when_words_stop(quiet), f"{self}::commit_when_words_stop"
         )
