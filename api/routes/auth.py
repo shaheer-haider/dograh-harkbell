@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.constants import ENABLE_SIGNUP
@@ -30,8 +32,11 @@ async def signup(request: SignupRequest):
     if existing_user:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    # Hash password and create user
-    hashed = hash_password(request.password)
+    # Hash password and create user.
+    # Harkbell: in a worker thread. bcrypt takes about 0.2 s, and this process
+    # has one event loop, which is carrying every live call's audio: hashed on
+    # the loop, no call is heard or answered until it is done.
+    hashed = await asyncio.to_thread(hash_password, request.password)
     user = await db_client.create_user_with_email(
         email=request.email,
         password_hash=hashed,
@@ -93,8 +98,12 @@ async def login(request: LoginRequest):
     if not user or not user.password_hash:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    # Verify password
-    if not verify_password(request.password, user.password_hash):
+    # Verify password.
+    # Harkbell: in a worker thread, as signup's hash is. Harkbell's API logs in
+    # as each business's own account, so a login lands in the middle of other
+    # people's calls: five in a row blocked the loop for 0.51 s on 2026-11-20
+    # ("Event loop blocked for 0.51s; every call on it waited").
+    if not await asyncio.to_thread(verify_password, request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     # Create JWT token
