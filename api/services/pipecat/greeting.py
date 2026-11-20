@@ -13,6 +13,7 @@ from api.services.pipecat.speech_playback import (
 )
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     ProposedUserStartedSpeakingFrame,
     ProposedUserStoppedSpeakingFrame,
@@ -126,6 +127,16 @@ class GreetingController:
             self._normal_strategies = None
             self._policy = None
             await controller.update_strategies(normal)
+            # Harkbell: the greeting is over, so the agent is not speaking. The
+            # normal strategies were swapped out while it played; if the last
+            # bot frame they saw was a start (the recorded-line notice, playing
+            # before the greeting was queued), they still believed the agent
+            # was talking and judged the caller by the barge-in rules: a "Hi."
+            # or a "Yeah." after the greeting was dropped as a back-channel or
+            # as under three words, and nobody answered (copy runs 6999, 7004,
+            # 2026-11-20).
+            for strategy in normal.start:
+                await strategy.process_frame(BotStoppedSpeakingFrame())
             # A caller may still be speaking when playback finishes, without
             # having crossed the greeting threshold. Let the restored strategy
             # adopt that onset so it can finish the turn on the final transcript.
