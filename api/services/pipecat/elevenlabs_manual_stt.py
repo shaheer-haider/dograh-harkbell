@@ -26,6 +26,17 @@ pause the analyzer judges unfinished is not committed, so the transcriber
 hears the sentence whole. A stop the analyzer does not answer within
 ``VERDICT_WAIT_SECONDS`` is committed anyway, and a hold that is never
 released is committed after ``HOLD_LIMIT_SECONDS`` of silence.
+
+Since ``-harkbell.41`` the transcriber's own words can end a turn too. On copy
+runs 6978 and 6980 (a mobile line from Pakistan) Scribe heard every word and
+those words stopped the greeting, but Silero scored the voice 0.4–0.66 against
+its 0.7 bar and never reported the caller speaking, so no commit was ever sent:
+"Hello? Hello?" waited 19 s, and a sentence said after a short VAD blip was
+never answered. A partial transcript with new words while the VAD is not
+reporting speech now arms a timer, and once the words have stopped changing for
+``WORDS_QUIET_SECONDS`` (``WORDS_NUMBER_QUIET_SECONDS`` when they end on a
+part-read number) the turn is committed. A caller the VAD hears never reaches
+it: partials during VAD speech arm nothing, and every commit cancels it.
 """
 
 import asyncio
@@ -42,6 +53,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.elevenlabs.stt import CommitStrategy, ElevenLabsRealtimeSTTService
 
+from api.services.pipecat.number_hold_turn_stop import unfinished_number
 from api.services.pipecat.transcript_commit import (
     TranscriptCommitHoldFrame,
     TranscriptCommitRequestFrame,
@@ -58,6 +70,13 @@ VERDICT_WAIT_SECONDS = 0.5
 # unfinished turn after its own 2 s and a part-read number after 1.5 s, so a
 # hold still standing after this was never going to be released.
 HOLD_LIMIT_SECONDS = 4.0
+# How long the transcriber's words must stop changing, with the VAD silent,
+# before they are committed. Scribe sends a partial for every new word while a
+# caller speaks, so a second without one is a pause, not a word in progress.
+WORDS_QUIET_SECONDS = 1.0
+# The same when the words end on a run of digits too short to be a whole order
+# number: a caller reading one off a screen pauses between digits.
+WORDS_NUMBER_QUIET_SECONDS = 2.0
 
 
 class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
@@ -73,6 +92,12 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
         self._commit_timer: asyncio.Task | None = None
         # Speech has been heard since the last commit.
         self._uncommitted = False
+        # The VAD is reporting the caller speaking.
+        self._vad_speaking = False
+        # The newest partial transcript, and the timer that commits it when the
+        # VAD never reports the speech behind it.
+        self._last_partial = ""
+        self._words_timer: asyncio.Task | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         if isinstance(frame, TranscriptCommitRequestFrame):
@@ -87,7 +112,11 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
             # The caller is speaking: whatever waited for a verdict is part of
             # what they are saying now.
             self._uncommitted = True
+            self._vad_speaking = True
             await self._cancel_commit_timer()
+            await self._cancel_words_timer()
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._vad_speaking = False
         if self.defer_commits and isinstance(frame, VADUserStoppedSpeakingFrame):
             # The ElevenLabs service would commit here. Its parent's handling
             # stays; the commit waits for the turn analyzer.
@@ -100,10 +129,44 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
             self._uncommitted = False
 
     async def _commit_heard(self) -> None:
+        await self._cancel_words_timer()
         if not self._uncommitted:
             return
         self._uncommitted = False
         await self._send_commit()
+
+    async def _on_words(self, text: str) -> None:
+        """New words from the transcriber: commit them if the VAD never does."""
+        if not text or text == self._last_partial:
+            return
+        self._last_partial = text
+        if self._vad_speaking:
+            return
+        self._uncommitted = True
+        await self._cancel_words_timer()
+        quiet = WORDS_NUMBER_QUIET_SECONDS if unfinished_number(text) else WORDS_QUIET_SECONDS
+        self._words_timer = self.create_task(
+            self._commit_when_words_stop(quiet), f"{self}::commit_when_words_stop"
+        )
+
+    async def _commit_when_words_stop(self, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        self._words_timer = None
+        if self._vad_speaking:
+            return
+        logger.info(
+            f"{self}: committing words the voice detector did not hear, "
+            f"{seconds}s after the last one: [{self._last_partial}]"
+        )
+        await self._commit_heard()
+
+    async def _cancel_words_timer(self) -> None:
+        if self._words_timer:
+            await self.cancel_task(self._words_timer)
+            self._words_timer = None
 
     async def _arm_commit_timer(self, seconds: float) -> None:
         await self._cancel_commit_timer()
@@ -175,10 +238,15 @@ class HarkbellElevenLabsRealtimeSTTService(ElevenLabsRealtimeSTTService):
             return
         if message_type in ("committed_transcript", "committed_transcript_with_timestamps"):
             self._commit_retries = 0
+            self._last_partial = ""
             await self._cancel_commit_retry()
+            await self._cancel_words_timer()
         await super()._process_response(data)
+        if message_type == "partial_transcript":
+            await self._on_words(str(data.get("text") or "").strip())
 
     async def _disconnect(self):
         await self._cancel_commit_retry()
         await self._cancel_commit_timer()
+        await self._cancel_words_timer()
         await super()._disconnect()
