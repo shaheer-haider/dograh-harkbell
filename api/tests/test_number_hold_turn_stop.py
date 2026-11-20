@@ -5,6 +5,7 @@ import pytest
 from pipecat.audio.turn.base_turn_analyzer import BaseTurnAnalyzer, EndOfTurnState
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
@@ -293,3 +294,88 @@ async def test_without_steering_it_asks_the_transcriber_for_nothing():
     assert strategy.pushed == []
     await strategy.cleanup()
 
+
+
+# -harkbell.39: copy run 6660. The event loop stalled 1.2 s mid-sentence, the
+# VAD controller forced a stop, and the turn analyzer's own silence timer was
+# never armed: "Hi, Vivid Seats support." waited 30 s for an answer.
+
+
+def _audio() -> InputAudioRawFrame:
+    return InputAudioRawFrame(audio=bytes(640), sample_rate=16000, num_channels=1)
+
+
+@pytest.mark.asyncio
+async def test_a_silent_caller_gets_an_answer_when_the_analyzer_never_ends_the_turn():
+    analyzer = _Analyzer(EndOfTurnState.INCOMPLETE)
+    strategy, stopped = await _strategy(
+        hold_secs=0.4, analyzer=analyzer, silence_backstop_secs=0.3
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(_interim("Hi, Vivid Seats support"))
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    # The transcriber's own hold limit commits it.
+    await strategy.process_frame(_final("Hi, Vivid Seats support."))
+    assert stopped == []
+    await asyncio.sleep(0.35)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_the_caller_speaking_again_stands_the_backstop_down():
+    analyzer = _Analyzer(EndOfTurnState.INCOMPLETE)
+    strategy, stopped = await _strategy(
+        hold_secs=0.4, analyzer=analyzer, silence_backstop_secs=0.3
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("I'm calling about"))
+    await asyncio.sleep(0.1)
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await asyncio.sleep(0.4)
+    assert stopped == []
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_after_the_audio_stopped_coming_keeps_the_turn_open():
+    strategy, stopped = await _strategy(hold_secs=0.4, silence_backstop_secs=5.0)
+    await strategy.process_frame(_audio())
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(_interim("Hi, Vivid"))
+    await asyncio.sleep(0.6)
+    # The VAD controller's forced stop: no audio for longer than a pause has.
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    assert strategy.pushed == ["TranscriptCommitHoldFrame"]
+    assert stopped == []
+    # The audio resumes with the rest of the sentence.
+    await strategy.process_frame(_audio())
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(_interim("Hi, Vivid Seats support"))
+    await strategy.process_frame(_audio())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    assert strategy.pushed == ["TranscriptCommitHoldFrame", "TranscriptCommitRequestFrame"]
+    await strategy.process_frame(_final("Hi, Vivid Seats support."))
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_final_that_lands_while_the_caller_speaks_does_not_end_their_next_pause():
+    strategy, stopped = await _strategy(hold_secs=0.4, final_wait_secs=5.0)
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(_interim("Hi"))
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    assert strategy.pushed == ["TranscriptCommitRequestFrame"]
+    # They carry on before the commit's final comes back.
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(_final("Hi."))
+    await strategy.process_frame(_interim("Vivid Seats support"))
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    # This pause's words are committed too, and the turn ends on them.
+    assert strategy.pushed == ["TranscriptCommitRequestFrame", "TranscriptCommitRequestFrame"]
+    assert stopped == []
+    await strategy.process_frame(_final("Vivid Seats support."))
+    assert len(stopped) == 1
+    await strategy.cleanup()

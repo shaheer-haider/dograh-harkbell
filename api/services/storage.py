@@ -19,8 +19,27 @@ from api.enums import Environment, StorageBackend
 
 from .filesystem import BaseFileSystem, MinioFileSystem, NullFileSystem, S3FileSystem
 
+# Harkbell: one storage instance per backend for the life of the process.
+# Building one builds an aioboto3 session, and its first client parses the S3
+# service model on the event loop: 0.05-0.1 s on the idle one-vCPU engine box,
+# 1.2 s with three calls running. Every call's start (its recorded notice),
+# every call's end (its artifacts) and every transcript download built a fresh
+# one, and each froze the audio of every other call on the box long enough for
+# the VAD controller to force a stop mid-sentence (copy runs 6660, 6668, 6669).
+# A reused session signs a URL in 3 ms.
+_storage_by_backend: dict[str, BaseFileSystem] = {}
+
 
 def get_storage_for_backend(backend: str) -> BaseFileSystem:
+    """The process's storage instance for a backend, built on first use."""
+    storage = _storage_by_backend.get(backend)
+    if storage is None:
+        storage = _build_storage_for_backend(backend)
+        _storage_by_backend[backend] = storage
+    return storage
+
+
+def _build_storage_for_backend(backend: str) -> BaseFileSystem:
     """Get storage instance for a specific backend enum.
 
     Maps StorageBackend enum codes to actual storage implementations:

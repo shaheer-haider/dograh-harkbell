@@ -29,6 +29,22 @@ Since ``-harkbell.38``:
   number, a commit when the turn is over. The turn then ends on that commit's
   own final, never on an earlier one. The number check reads the interim
   transcript too, since nothing is final until the commit.
+
+Since ``-harkbell.39`` a turn always ends (copy run 6660: "Hi, Vivid Seats
+support." went unanswered for 30 s after the event loop stalled for 1.2 s
+mid-sentence):
+
+- A VAD stop that comes when no audio has arrived for ``AUDIO_GAP_SECS`` is
+  the audio stopping, not the caller: the VAD controller forces one after a
+  second without frames. It is not judged as a pause. The transcriber holds
+  its commit and the turn stays open for the rest of the sentence.
+- Every VAD stop arms a backstop: if nothing has ended the turn after the turn
+  analyzer's own silence window and ``SILENCE_BACKSTOP_MARGIN_SECS``, with the
+  caller still silent, the strategy ends it. The analyzer's own silence timer
+  is armed only by audio it has been told is speech, and the burst of audio a
+  stall releases can reach it after VAD has already called that audio over.
+- A final that arrives while the caller is speaking again answers a commit
+  from before they did, so it does not stand for this pause's commit.
 """
 
 import asyncio
@@ -39,6 +55,7 @@ from loguru import logger
 
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
@@ -77,6 +94,15 @@ _EDGE_PUNCTUATION = re.compile(r"^[^\w:]+|[^\w:]+$")
 # How long the final of a requested commit is waited for before the turn ends
 # on what it has. A commit with no speech in it has no final at all.
 COMMIT_FINAL_WAIT_SECS = 1.0
+# A VAD stop this long after the last audio frame is the audio stopping, not
+# the caller. Frames arrive every 20 ms; the VAD controller forces a stop after
+# a whole second without one.
+AUDIO_GAP_SECS = 0.5
+# How long past the turn analyzer's own silence window a silent caller waits
+# before the strategy ends the turn itself.
+SILENCE_BACKSTOP_MARGIN_SECS = 0.25
+# The analyzer's silence window when it does not say (pipecat's Smart Turn default).
+DEFAULT_ANALYZER_STOP_SECS = 3.0
 
 
 def _tokens(text: str, *, lower: bool = True) -> list[str]:
@@ -190,12 +216,14 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         hold_secs: float = NUMBER_HOLD_SECS,
         steer_commits: bool = True,
         final_wait_secs: float = COMMIT_FINAL_WAIT_SECS,
+        silence_backstop_secs: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._hold_secs = hold_secs
         self._steer_commits = steer_commits
         self._final_wait_secs = final_wait_secs
+        self._silence_backstop_secs = silence_backstop_secs
         self._turn_text = ""
         self._interim_text = ""
         self._speech_ended_at: float | None = None
@@ -205,11 +233,30 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         self._commit_requested = False
         self._awaiting_final = False
         self._final_wait_task: asyncio.Task | None = None
+        # When the last audio frame reached the strategy (monotonic).
+        self._last_audio_at: float | None = None
+        self._backstop_task: asyncio.Task | None = None
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
-        if isinstance(frame, InterimTranscriptionFrame) and frame.text and frame.text.strip():
+        if isinstance(frame, InputAudioRawFrame):
+            self._last_audio_at = time.monotonic()
+        elif isinstance(frame, InterimTranscriptionFrame) and frame.text and frame.text.strip():
             self._interim_text = frame.text.strip()
         return await super().process_frame(frame)
+
+    def _backstop_seconds(self) -> float:
+        if self._silence_backstop_secs is not None:
+            return self._silence_backstop_secs
+        params = getattr(self._turn_analyzer, "params", None)
+        stop_secs = getattr(params, "stop_secs", None) or DEFAULT_ANALYZER_STOP_SECS
+        return stop_secs + SILENCE_BACKSTOP_MARGIN_SECS
+
+    def _audio_gap(self) -> float | None:
+        """How long the audio has been missing, when that is why VAD stopped."""
+        if self._last_audio_at is None:
+            return None
+        missing = time.monotonic() - self._last_audio_at
+        return missing if missing >= AUDIO_GAP_SECS else None
 
     async def _reset(self):
         self._turn_text = ""
@@ -223,11 +270,13 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         self._awaiting_final = False
         await self._cancel_task("_hold_task")
         await self._cancel_task("_final_wait_task")
+        await self._cancel_task("_backstop_task")
         await super()._discard_pending_end_of_turn()
 
     async def cleanup(self):
         await self._cancel_task("_hold_task")
         await self._cancel_task("_final_wait_task")
+        await self._cancel_task("_backstop_task")
         await super().cleanup()
 
     async def _cancel_task(self, name: str):
@@ -239,18 +288,55 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
     async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         # Set first: the parent ends by asking whether the turn may stop.
         self._speech_ended_at = frame.timestamp - frame.stop_secs
-        await super()._handle_vad_user_stopped_speaking(frame)
+        gap = self._audio_gap()
+        if gap is not None:
+            # The audio stopped, not the caller: judging the pause would end
+            # the turn mid-sentence on whatever came before the gap.
+            logger.info(
+                f"{self}: no audio for {gap:.2f}s while the caller was speaking; "
+                "keeping the turn open for the rest of it"
+            )
+            self._vad_user_speaking = False
+            self._vad_stopped = True
+            self._turn_complete = False
+        else:
+            await super()._handle_vad_user_stopped_speaking(frame)
         if self._steer_commits and not self._turn_complete:
             # The analyzer heard more coming: the transcriber keeps listening.
             await self.push_frame(TranscriptCommitHoldFrame(), FrameDirection.UPSTREAM)
+        await self._cancel_task("_backstop_task")
+        seconds = self._backstop_seconds()
+        self._backstop_task = self.task_manager.create_task(
+            self._silence_backstop(seconds), f"{self}::silence_backstop"
+        )
+
+    async def _silence_backstop(self, seconds: float):
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._backstop_task = None
+        if self._vad_user_speaking:
+            return
+        if not self._turn_complete:
+            logger.info(
+                f"{self}: {seconds:.2f}s of silence with no end of turn from the analyzer; "
+                "ending the turn"
+            )
+            self._turn_complete = True
+        await self._maybe_trigger_user_turn_stopped()
 
     async def _handle_transcription(self, frame: TranscriptionFrame):
         if frame.text and frame.text.strip():
             self._turn_text = f"{self._turn_text} {frame.text.strip()}".strip()
         self._interim_text = ""
         # A final nobody asked for is the transcriber committing on its own
-        # (no verdict reached it in time): that is this pause's commit.
-        self._commit_requested = True
+        # (no verdict reached it in time): that is this pause's commit. One
+        # that arrives while the caller is speaking again answers a commit
+        # from before they did, and this pause's is still to come.
+        if not self._vad_user_speaking:
+            self._commit_requested = True
         if self._awaiting_final:
             self._awaiting_final = False
             await self._cancel_task("_final_wait_task")

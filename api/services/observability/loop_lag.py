@@ -19,11 +19,18 @@ The gauge is a module global updated by one background task and read (peek) off
 import asyncio
 import math
 
+from loguru import logger
+
 # Single in-process gauge — exactly the unit (one event loop) we're sizing. A
 # window of recent lag samples is enough for a p95; no metrics library.
 _INTERVAL = 0.1  # seconds between probes
 _WINDOW = 600  # ~60s of samples at 0.1s cadence
 _samples: list[float] = []
+# Harkbell: a single block this long is logged. Calls share this loop, and a
+# second without it is a second of every caller's audio unprocessed: the VAD
+# controller forces a stop after 1 s (copy run 6660, from building an S3
+# client). The log names the moment; whatever logged just before is the suspect.
+_BLOCK_WARN_MS = 500.0
 # Strong ref to the monitor task: asyncio keeps only a weak reference, so
 # without this the task can be garbage-collected mid-run and the gauge dies.
 _task: "asyncio.Task | None" = None
@@ -37,6 +44,8 @@ async def _monitor() -> None:
         lag_ms = (loop.time() - t0 - _INTERVAL) * 1000
         if lag_ms < 0:  # clock jitter; floor at 0
             lag_ms = 0.0
+        if lag_ms >= _BLOCK_WARN_MS:
+            logger.warning(f"Event loop blocked for {lag_ms / 1000:.2f}s; every call on it waited")
         _samples.append(lag_ms)
         if len(_samples) > _WINDOW:
             del _samples[: len(_samples) - _WINDOW]

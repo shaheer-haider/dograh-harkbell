@@ -64,3 +64,34 @@ async def test_blocked_loop_is_detected():
         pass
     await asyncio.sleep(0.15)
     assert loop_lag.stats()["max_ms"] > 50
+
+
+@pytest.mark.asyncio
+async def test_a_block_long_enough_to_cut_a_callers_audio_is_logged():
+    # Harkbell: copy run 6660 lost a sentence to a 1.2 s block nothing logged.
+    import time
+
+    from loguru import logger
+
+    warnings: list[str] = []
+    sink = logger.add(lambda message: warnings.append(str(message)), level="WARNING")
+    try:
+        loop_lag.start()
+        await asyncio.sleep(0.15)
+        time.sleep(0.6)  # blocks the loop, as a synchronous call on it does
+        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.15)
+    finally:
+        logger.remove(sink)
+    import re
+
+    blocked = [float(m.group(1)) for w in warnings if (m := re.search(r"blocked for ([0-9.]+)s", w))]
+    assert blocked and max(blocked) >= 0.5, warnings
+    # A loop that never blocks says nothing.
+    warnings.clear()
+    sink = logger.add(lambda message: warnings.append(str(message)), level="WARNING")
+    try:
+        await asyncio.sleep(0.35)
+    finally:
+        logger.remove(sink)
+    assert not any("Event loop blocked" in w for w in warnings)
