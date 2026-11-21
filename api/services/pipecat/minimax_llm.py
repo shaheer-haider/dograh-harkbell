@@ -96,6 +96,7 @@ from api.services.pipecat.reasks import (
     hands_off_itself,
     reask_count,
 )
+from api.services.pipecat.read_backs import ReadBackGuard
 from api.services.pipecat.spoken_reasoning import SpokenReasoningFilter
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.minimax.llm import MiniMaxLLMService
@@ -357,10 +358,14 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         # spoken; a service built for one text-chat turn reads it back from
         # the context instead.
         repeats = None
+        readbacks = None
         opening = False
         if caller_has_spoken(context):
             greeting = self._greeting or greeting_from_context(context)
             repeats = GreetingRepeatGuard(greeting) if greeting else None
+            # A number read back is the one the caller was heard saying
+            # (read_backs.py).
+            readbacks = ReadBackGuard.from_context(context)
         else:
             opening = self._greeting is None
         # Three re-asks in a row hand the call on (reasks.py): on a step that
@@ -379,6 +384,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
             repeats=repeats,
             opening=opening,
             reasks=reasks,
+            readbacks=readbacks,
         )
 
     async def _drop_spoken_reasoning(
@@ -388,6 +394,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         repeats: GreetingRepeatGuard | None = None,
         opening: bool = False,
         reasks: ReAskGuard | None = None,
+        readbacks: ReadBackGuard | None = None,
     ) -> AsyncIterator[ChatCompletionChunk]:
         """The reply without the model's own reasoning in it (``spoken_reasoning.py``).
 
@@ -396,7 +403,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         agent's turn in the context. Structured tool calls pass untouched: a
         reply that was all reasoning says nothing, and its calls still run.
         """
-        reasoning = SpokenReasoningFilter(repeats=repeats, reasks=reasks)
+        reasoning = SpokenReasoningFilter(repeats=repeats, reasks=reasks, readbacks=readbacks)
         tool_names: set[str] = set()
         next_index = 0
         try:

@@ -37,6 +37,7 @@ from loguru import logger
 
 from api.services.pipecat.cut_off import CUT_OFF_MARKER
 from api.services.pipecat.greeting_repeats import GreetingRepeatGuard
+from api.services.pipecat.read_backs import ReadBackGuard
 from api.services.pipecat.reasks import ReAskGuard
 
 # A parameter or tool name: lower_snake_case. Not part of an email address or a
@@ -111,6 +112,7 @@ class SpokenReasoningFilter:
         self,
         repeats: "GreetingRepeatGuard | None" = None,
         reasks: "ReAskGuard | None" = None,
+        readbacks: "ReadBackGuard | None" = None,
     ):
         self._buffer = ""
         self._held: list[str] = []
@@ -121,6 +123,9 @@ class SpokenReasoningFilter:
         self._repeats = repeats
         # The run of re-asks this reply may be the third of (reasks.py).
         self._reasks = reasks
+        # The caller's digits, which a read-back in this reply is held to
+        # (read_backs.py).
+        self._readbacks = readbacks
         # Everything this reply has handed on to be spoken.
         self.said = ""
 
@@ -202,6 +207,8 @@ class SpokenReasoningFilter:
                 piece = self._repeats.say(piece)
                 if not piece:
                     continue
+            if self._readbacks is not None:
+                piece = self._readbacks.say(piece)
             if self._reasks is None or self._reasks.pass_on(piece):
                 kept.append(piece)
         kept = "".join(kept)

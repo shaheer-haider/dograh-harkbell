@@ -521,6 +521,17 @@ class CustomToolManager:
                     organization_id=await self.get_organization_id(),
                 )
 
+                line_says = self._line_says(result)
+                if line_says:
+                    # The answer is one sentence, said as it stands: the line
+                    # says it and the model is not run to say it again.
+                    logger.info(f"{function_name} answered with a sentence for the line; saying it")
+                    await self._engine.queue_text_message(line_says)
+                    await function_call_params.result_callback(
+                        result, properties=FunctionCallResultProperties(run_llm=False)
+                    )
+                    return
+
                 await function_call_params.result_callback(result)
 
             except Exception as e:
@@ -530,6 +541,28 @@ class CustomToolManager:
                 )
 
         return http_tool_handler
+
+    def _line_says(self, result: Any) -> str | None:
+        """The sentence an HTTP tool's answer asks the line itself to say.
+
+        Harkbell. Copy run 7101 (2026-11-21): route_call answered the email
+        route with its sentence written out, and the model was run again only
+        to say it -- a second time to first token (0.49 s) on the slowest
+        reply of the call, 2.5 s after the caller's last word. Where the
+        answer carries ``line_says`` the engine speaks it at once and the
+        model is not run; the answer stays in the context, so the next reply
+        knows it has been said. Never on a realtime line: the model there
+        speaks for itself, and a sentence played beside it would be said twice.
+        """
+        if getattr(self._engine, "_is_realtime", False):
+            return None
+        data = result.get("data") if isinstance(result, dict) else None
+        for candidate in (data, result):
+            if isinstance(candidate, dict):
+                said = candidate.get("line_says")
+                if isinstance(said, str) and said.strip():
+                    return said.strip()
+        return None
 
     def _create_mcp_handler(self, session: "McpToolSession", function_name: str):
         """Create a handler that proxies an LLM function call to a live MCP
