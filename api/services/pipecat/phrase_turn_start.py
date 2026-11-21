@@ -40,6 +40,8 @@ _DIGIT_WORDS = frozenset(
 )
 # How long a short final still counts towards the next one's word count.
 _CARRY_SECONDS = 3.0
+# How long after a final carrying a number a lone digit word is still part of it.
+_NUMBER_CONTEXT_SECONDS = 8.0
 
 
 def carries_a_number(tokens: list[str]) -> bool:
@@ -131,6 +133,8 @@ class PhraseAwareUserTurnStartStrategy(MinWordsUserTurnStartStrategy):
         # when the last of them arrived (see _handle_transcription).
         self._carried_words = 0
         self._carried_at = 0.0
+        # When a final last carried a number, bot speaking or not.
+        self._number_heard_at: float | None = None
 
     async def handle_user_turn_started(self):
         self._carried_words = 0
@@ -139,11 +143,13 @@ class PhraseAwareUserTurnStartStrategy(MinWordsUserTurnStartStrategy):
     async def _handle_transcription(
         self, frame: TranscriptionFrame | InterimTranscriptionFrame
     ) -> ProcessFrameResult:
+        tokens = normalize_transcript(frame.text).split()
+        is_interim = isinstance(frame, InterimTranscriptionFrame)
+        if not is_interim and carries_a_number(tokens):
+            self._number_heard_at = time.monotonic()
         if not self._bot_speaking:
             return await super()._handle_transcription(frame)
 
-        tokens = normalize_transcript(frame.text).split()
-        is_interim = isinstance(frame, InterimTranscriptionFrame)
         if self._ignore.covers(tokens):
             logger.debug(
                 f"{self} ignoring back-channel {frame.text!r} while bot speaking "
@@ -158,7 +164,7 @@ class PhraseAwareUserTurnStartStrategy(MinWordsUserTurnStartStrategy):
             )
             await self.trigger_user_turn_started()
             return ProcessFrameResult.STOP
-        if carries_a_number(tokens):
+        if carries_a_number(tokens) or self._continues_a_number(tokens):
             logger.debug(
                 f"{self} number in {frame.text!r} while bot speaking "
                 f"interim_transcription={is_interim}"
@@ -187,6 +193,23 @@ class PhraseAwareUserTurnStartStrategy(MinWordsUserTurnStartStrategy):
                 return ProcessFrameResult.STOP
             self._carried_words += len(tokens)
         return await super()._handle_transcription(frame)
+
+
+    def _continues_a_number(self, tokens: list[str]) -> bool:
+        """A lone digit word said while a number is being read out.
+
+        Copy run 7042 (2026-11-21, AssemblyAI): the caller read 5512084 a
+        digit at a time and the agent read each part back. The transcriber
+        wrote "5," "2," "8," as digits but "one" and "zero" as words, each
+        said over a read-back, and a single word is under the three-word
+        threshold -- both were dropped, twice, and the agent heard 5528. On
+        its own "one" stays a word; a few seconds after a digit it is a digit.
+        """
+        if len(tokens) != 1 or tokens[0] not in _DIGIT_WORDS:
+            return False
+        if self._number_heard_at is None:
+            return False
+        return time.monotonic() - self._number_heard_at <= _NUMBER_CONTEXT_SECONDS
 
 
 def create_turn_start_strategy(

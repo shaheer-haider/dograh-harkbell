@@ -396,4 +396,8 @@ def test_non_realtime_holds_numbers_when_the_transcriber_commits_on_vad(monkeypa
     )
 
     assert isinstance(held[0], NumberHoldTurnAnalyzerUserTurnStopStrategy)
-    assert type(plain[0]) is TurnAnalyzerUserTurnStopStrategy
+    assert held[0].steers_commits
+    # -harkbell.44: every transcriber holds a part-read number (copy run 7042,
+    # AssemblyAI); only the manually committed one is told when to commit.
+    assert isinstance(plain[0], NumberHoldTurnAnalyzerUserTurnStopStrategy)
+    assert not plain[0].steers_commits

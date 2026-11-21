@@ -130,7 +130,6 @@ from pipecat.turns.user_start.vad_user_turn_start_strategy import (
 from pipecat.turns.user_stop import (
     ExternalUserTurnStopStrategy,
     SpeechTimeoutUserTurnStopStrategy,
-    TurnAnalyzerUserTurnStopStrategy,
 )
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.enums import RealtimeFeedbackType
@@ -288,13 +287,14 @@ def _create_non_realtime_user_turn_stop_strategies(
                 "smart_turn_stop_secs", DEFAULT_SMART_TURN_STOP_SECS
             )
         )
-        strategy = (
-            NumberHoldTurnAnalyzerUserTurnStopStrategy
-            if hold_numbers
-            else TurnAnalyzerUserTurnStopStrategy
-        )
+        # Since -harkbell.44 every transcriber gets the number hold; only the
+        # manually committed one is also told when to commit (copy run 7042:
+        # on AssemblyAI each slowly read digit was a turn of its own).
         return [
-            strategy(turn_analyzer=LocalSmartTurnAnalyzerV3(params=smart_turn_params))
+            NumberHoldTurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3(params=smart_turn_params),
+                steer_commits=hold_numbers,
+            )
         ]
 
     return [SpeechTimeoutUserTurnStopStrategy()]
@@ -1050,6 +1050,7 @@ async def _run_pipeline_impl(
         if isinstance(stt, HarkbellElevenLabsRealtimeSTTService):
             stt.defer_commits = any(
                 isinstance(strategy, NumberHoldTurnAnalyzerUserTurnStopStrategy)
+                and strategy.steers_commits
                 for strategy in user_turn_stop_strategies
             )
         # A keypress is a complete turn of its own, ahead of whatever word

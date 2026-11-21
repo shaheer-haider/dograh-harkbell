@@ -45,6 +45,20 @@ mid-sentence):
   stall releases can reach it after VAD has already called that audio over.
 - A final that arrives while the caller is speaking again answers a commit
   from before they did, so it does not stand for this pause's commit.
+
+Since ``-harkbell.44`` it runs for every transcriber the engine ends turns for,
+not only the manually committed one (``steer_commits=False`` there). Copy run
+7042 (2026-11-21, AssemblyAI): the caller read 5512084 a digit at a time and
+each digit was a turn of its own, answered with a read-back the next digits
+landed on. The VAD heard none of those digits, so each turn ended on Pipecat's
+fallback -- a transcript with no VAD stop is a finished turn 0.42 s later --
+which never asked whether the words were part of a number. Without steering:
+
+- Words that arrive while the VAD is silent, and not as the final of speech it
+  just heard stop, are speech it missed. The hold restarts from them: the
+  caller is still reading, and the silence is counted from their last word.
+- An interim with new words while a hold is pending is the caller still
+  speaking: the hold starts again in full.
 """
 
 import asyncio
@@ -103,6 +117,9 @@ AUDIO_GAP_SECS = 0.5
 SILENCE_BACKSTOP_MARGIN_SECS = 0.25
 # The analyzer's silence window when it does not say (pipecat's Smart Turn default).
 DEFAULT_ANALYZER_STOP_SECS = 3.0
+# A final this soon after the speech end the VAD reported is that speech's own
+# final; one later than this is words the VAD never heard.
+OWN_FINAL_SECS = 1.0
 
 
 def _tokens(text: str, *, lower: bool = True) -> list[str]:
@@ -227,6 +244,8 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         self._turn_text = ""
         self._interim_text = ""
         self._speech_ended_at: float | None = None
+        # When the speech the VAD last reported stopping ended (wall clock).
+        self._vad_ended_at: float | None = None
         self._hold_task: asyncio.Task | None = None
         self._hold_expired = False
         # This pause's commit has been asked for, and its final not yet seen.
@@ -237,12 +256,37 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         self._last_audio_at: float | None = None
         self._backstop_task: asyncio.Task | None = None
 
+    @property
+    def steers_commits(self) -> bool:
+        """Whether this strategy tells the transcriber when to commit."""
+        return self._steer_commits
+
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         if isinstance(frame, InputAudioRawFrame):
             self._last_audio_at = time.monotonic()
         elif isinstance(frame, InterimTranscriptionFrame) and frame.text and frame.text.strip():
-            self._interim_text = frame.text.strip()
+            text = frame.text.strip()
+            if (
+                not self._steer_commits
+                and not self._vad_user_speaking
+                and self._hold_task is not None
+                and text != self._interim_text
+            ):
+                # The caller is still reading the number the hold is for.
+                await self._cancel_task("_hold_task")
+                self._speech_ended_at = time.time()
+                self._hold_task = self.task_manager.create_task(
+                    self._hold(self._hold_secs), f"{self}::number_hold"
+                )
+            self._interim_text = text
         return await super().process_frame(frame)
+
+    def _words_the_vad_missed(self) -> bool:
+        if self._steer_commits or self._vad_user_speaking:
+            return False
+        if self._vad_ended_at is None:
+            return True
+        return time.time() - self._vad_ended_at > OWN_FINAL_SECS
 
     def _backstop_seconds(self) -> float:
         if self._silence_backstop_secs is not None:
@@ -266,6 +310,7 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
     async def _discard_pending_end_of_turn(self):
         self._hold_expired = False
         self._speech_ended_at = None
+        self._vad_ended_at = None
         self._commit_requested = False
         self._awaiting_final = False
         await self._cancel_task("_hold_task")
@@ -288,6 +333,7 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
     async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         # Set first: the parent ends by asking whether the turn may stop.
         self._speech_ended_at = frame.timestamp - frame.stop_secs
+        self._vad_ended_at = self._speech_ended_at
         gap = self._audio_gap()
         if gap is not None:
             # The audio stopped, not the caller: judging the pause would end
@@ -328,6 +374,14 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         await self._maybe_trigger_user_turn_stopped()
 
     async def _handle_transcription(self, frame: TranscriptionFrame):
+        missed = bool(frame.text and frame.text.strip()) and self._words_the_vad_missed()
+        if missed:
+            # Speech the VAD never heard: its silence starts now, and an
+            # earlier hold or timeout no longer speaks for the turn.
+            await self._cancel_task("_hold_task")
+            self._hold_expired = False
+            self._timeout_expired = False
+            self._speech_ended_at = time.time()
         if frame.text and frame.text.strip():
             self._turn_text = f"{self._turn_text} {frame.text.strip()}".strip()
         self._interim_text = ""
@@ -341,6 +395,10 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
             self._awaiting_final = False
             await self._cancel_task("_final_wait_task")
         await super()._handle_transcription(frame)
+        if missed and self._turn_complete and self._timeout_task is None:
+            # Pipecat's fallback arms its own timer only before any VAD stop
+            # this turn; after one, nothing else would judge these words.
+            await self._maybe_trigger_user_turn_stopped()
 
     def _heard(self) -> str:
         return f"{self._turn_text} {self._interim_text}".strip()

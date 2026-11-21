@@ -495,3 +495,26 @@ async def test_normal_strategies_come_back_after_the_greeting():
     playback.greeting_pending = False
     await controller._update_strategies(user, Frame())
     assert user.user_turn_controller.user_turn_strategies is normal
+
+
+# -harkbell.44: copy run 7042 (AssemblyAI). "one" and "zero" of 5512084 came as
+# words, each said over a read-back, and were dropped under the word count --
+# twice. A lone digit word a few seconds after a digit is part of the number.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("word", ["One.", "zero", "Oh."])
+async def test_a_lone_digit_word_after_a_digit_starts_the_turn_over_the_bot(word):
+    strategy, seen = strategy_with(min_words=3, ignore=[])
+    await strategy.process_frame(transcript("5, 5."))
+    await strategy.process_frame(BotStartedSpeakingFrame())
+    assert await strategy.process_frame(transcript(word)) is ProcessFrameResult.STOP
+    assert seen.starts == 2
+
+
+@pytest.mark.asyncio
+async def test_a_lone_digit_word_with_no_number_before_it_stays_a_word():
+    strategy, seen = strategy_with(min_words=3)
+    await strategy.process_frame(BotStartedSpeakingFrame())
+    assert await strategy.process_frame(transcript("One.")) is ProcessFrameResult.CONTINUE
+    assert seen.starts == 0

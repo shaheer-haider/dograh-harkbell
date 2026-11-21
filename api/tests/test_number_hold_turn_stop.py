@@ -379,3 +379,74 @@ async def test_a_final_that_lands_while_the_caller_speaks_does_not_end_their_nex
     await strategy.process_frame(_final("Vivid Seats support."))
     assert len(stopped) == 1
     await strategy.cleanup()
+
+
+# -harkbell.44: copy run 7042 (AssemblyAI). The VAD heard none of the caller's
+# slowly read digits, so each final ended the turn on Pipecat's fallback and
+# 5512084 reached the agent as "5 5." / "2," / "8," -- each answered with a
+# read-back the next digits landed on.
+
+
+def _heard_only_by_the_transcriber(text: str) -> TranscriptionFrame:
+    # AssemblyAI's finals are finalized only when a VAD stop asked for them.
+    return TranscriptionFrame(text=text, user_id="", timestamp="")
+
+
+@pytest.mark.asyncio
+async def test_digits_the_vad_never_hears_are_held_as_one_number():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_heard_only_by_the_transcriber("SeatGeek support. Order 5 5."))
+    await asyncio.sleep(0.25)
+    assert stopped == []
+    await strategy.process_frame(_heard_only_by_the_transcriber("1, 2,"))
+    await asyncio.sleep(0.25)
+    # The hold counts from the last digit, not the first.
+    assert stopped == []
+    await strategy.process_frame(_heard_only_by_the_transcriber("0, 8, 4."))
+    await asyncio.sleep(0.5)
+    assert len(stopped) == 1
+    assert strategy.pushed == []
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_whole_number_the_vad_never_hears_ends_the_turn_at_once():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_heard_only_by_the_transcriber("Order 64417208."))
+    await asyncio.sleep(0.05)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_sentence_the_vad_never_hears_is_not_held():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_heard_only_by_the_transcriber("The customer hasn't received the tickets."))
+    await asyncio.sleep(0.05)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_new_words_in_an_interim_start_the_hold_again():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_heard_only_by_the_transcriber("Order 5 5."))
+    await asyncio.sleep(0.3)
+    await strategy.process_frame(_interim("1"))
+    await asyncio.sleep(0.3)
+    assert stopped == []
+    await asyncio.sleep(0.2)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_number_the_vad_hears_is_held_from_the_vad_stop_as_before():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("The order number is seven"))
+    assert stopped == []
+    await asyncio.sleep(0.3)
+    assert len(stopped) == 1
+    await strategy.cleanup()
