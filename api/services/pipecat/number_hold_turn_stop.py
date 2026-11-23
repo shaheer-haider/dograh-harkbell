@@ -73,6 +73,11 @@ the words are timed the way the manually committed transcriber times them
 dash, comma, filler, joining word or part-read number, or words with no full
 stop after them. Words still changing
 restart it; the caller speaking again cancels it.
+
+Since ``-harkbell.47`` the same holds when the VAD heard none of the turn:
+words with no full stop after them ("Order", "Uh, the customer") wait 2.0 s
+for more instead of ending on Pipecat's fallback 0.22 s later (copy run 7295).
+A part-read number keeps its own hold.
 """
 
 import asyncio
@@ -419,11 +424,31 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
             self._awaiting_final = False
             await self._cancel_task("_final_wait_task")
         await super()._handle_transcription(frame)
-        if missed and self._turn_complete and self._timeout_task is None:
+        if missed and self._turn_complete and self._words_trail_off():
+            # Copy run 7295 (2026-11-23): "Order" and a breath before the
+            # digits. The VAD heard none of it, Pipecat's fallback ended the
+            # turn 0.22 s after the word, the agent began "Go--", and the
+            # digits said over it came back as "6 for all when 7". Words that
+            # trail off are not a finished turn just because nothing else
+            # judged them: they wait for more, as the analyzer's would.
+            await self._cancel_task("_timeout_task")
+            self._turn_complete = False
+        elif missed and self._turn_complete and self._timeout_task is None:
             # Pipecat's fallback arms its own timer only before any VAD stop
             # this turn; after one, nothing else would judge these words.
             await self._maybe_trigger_user_turn_stopped()
         await self._arm_words_quiet()
+
+    def _words_trail_off(self) -> bool:
+        """Whether the words so far stop without ending, on a transcriber that punctuates."""
+        heard = self._heard().rstrip()
+        return (
+            bool(heard)
+            and heard[-1] not in ".?!"
+            # A number has its own hold, and a whole one ends at once.
+            and not heard[-1].isdigit()
+            and not unfinished_number(heard)
+        )
 
     async def _arm_words_quiet(self):
         """Time the words while the analyzer holds the turn open (since .46)."""

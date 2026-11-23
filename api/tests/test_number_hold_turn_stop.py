@@ -541,3 +541,36 @@ async def test_a_steering_strategy_leaves_the_words_to_the_transcriber():
     await asyncio.sleep(1.0)
     assert stopped == []
     await strategy.cleanup()
+
+
+# -harkbell.47: copy run 7295. "Order" and a breath, unheard by the VAD, ended
+# the turn on Pipecat's fallback 0.22 s later.
+@pytest.mark.asyncio
+async def test_words_the_vad_never_hears_that_trail_off_wait_for_more():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_final("Order"))
+    await asyncio.sleep(1.0)
+    assert stopped == []
+    await asyncio.sleep(1.3)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_the_rest_of_the_words_ends_the_turn_on_its_own_timing():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_final("Order"))
+    await asyncio.sleep(0.8)
+    await strategy.process_frame(_final("64417208."))
+    await asyncio.sleep(0.6)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_finished_sentence_the_vad_never_hears_still_ends_at_once():
+    strategy, stopped = await _strategy(hold_secs=0.4, steer_commits=False)
+    await strategy.process_frame(_final("Hello?"))
+    await asyncio.sleep(0.6)
+    assert len(stopped) == 1
+    await strategy.cleanup()
