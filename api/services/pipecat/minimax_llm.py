@@ -237,6 +237,37 @@ def _tool_call_chunk(index: int, name: str, arguments: dict) -> ChatCompletionCh
     )
 
 
+def answers_a_silent_reply(messages) -> bool:
+    """Whether this reply answers a tool whose answer asks for no words beside the next call.
+
+    Harkbell. Copy run 7251 (2026-11-23): route_call put an urgent order
+    through and its answer said "Call transfer_call now and say nothing
+    yourself"; the model said "Thanks. So the buyer can't get in, and the
+    event's tonight at eight -- let me get that to the right place." first,
+    and the caller waited seven seconds for the transfer while it was spoken.
+    The transfer tool says its own sentence. An answer carrying
+    ``silent_reply: true`` makes that the engine's rule rather than the
+    model's: the reply's words are held, and dropped if it calls a tool.
+    """
+    for message in reversed(list(messages or [])):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "tool":
+            content = message.get("content")
+            try:
+                value = json.loads(content) if isinstance(content, str) else content
+            except (TypeError, ValueError):
+                return False
+            for candidate in (value, value.get("data") if isinstance(value, dict) else None):
+                if isinstance(candidate, dict) and candidate.get("silent_reply") is True:
+                    return True
+            return False
+        if role in ("user", "assistant") and (message.get("content") or "").__str__().strip():
+            return False
+    return False
+
+
 class HarkbellMiniMaxLLMService(MiniMaxLLMService):
     """``MiniMaxLLMService`` that never lets a written tool call become the reply."""
 
@@ -385,6 +416,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
             opening=opening,
             reasks=reasks,
             readbacks=readbacks,
+            silent=answers_a_silent_reply(getattr(context, "messages", None)),
         )
 
     async def _drop_spoken_reasoning(
@@ -395,6 +427,7 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         opening: bool = False,
         reasks: ReAskGuard | None = None,
         readbacks: ReadBackGuard | None = None,
+        silent: bool = False,
     ) -> AsyncIterator[ChatCompletionChunk]:
         """The reply without the model's own reasoning in it (``spoken_reasoning.py``).
 
@@ -404,6 +437,10 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
         reply that was all reasoning says nothing, and its calls still run.
         """
         reasoning = SpokenReasoningFilter(repeats=repeats, reasks=reasks, readbacks=readbacks)
+        # A reply to an answer that asked for no words of the model's own
+        # (``answers_a_silent_reply``) is held until it is known whether it
+        # calls a tool: one that does says nothing, one that does not is said.
+        held_silent = ""
         tool_names: set[str] = set()
         next_index = 0
         try:
@@ -417,8 +454,19 @@ class HarkbellMiniMaxLLMService(MiniMaxLLMService):
                             tool_names.add(name)
                     if delta.content:
                         delta.content = reasoning.feed(delta.content) or None
+                        if silent and delta.content:
+                            held_silent += delta.content
+                            delta.content = None
                 yield chunk
             rest = reasoning.finish()
+            if silent:
+                rest = held_silent + rest
+                if tool_names and rest.strip():
+                    logger.info(
+                        f"[run {run_id_var.get()}] the answer asked for no words beside "
+                        f"{sorted(tool_names)}; dropping {rest.strip()[:120]!r}"
+                    )
+                    rest = ""
             if rest:
                 yield _content_chunk(rest)
             if opening and reasoning.said.strip():

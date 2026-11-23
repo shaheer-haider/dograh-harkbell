@@ -49,7 +49,7 @@ async def test_the_line_says_the_sentence_and_the_model_is_not_run(monkeypatch):
     manager, engine = _manager(realtime=False)
     answer = {"status": "success", "data": {"result": "routed", "line_says": EMAIL, "instructions": "…"}}
     callback = await _run(manager, monkeypatch, answer)
-    engine.queue_text_message.assert_awaited_once_with(EMAIL)
+    engine.queue_text_message.assert_awaited_once_with(EMAIL, append_to_context=True)
     (result,), kwargs = callback.await_args
     assert result == answer
     assert kwargs["properties"].run_llm is False

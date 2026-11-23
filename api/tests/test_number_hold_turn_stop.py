@@ -450,3 +450,94 @@ async def test_a_number_the_vad_hears_is_held_from_the_vad_stop_as_before():
     await asyncio.sleep(0.3)
     assert len(stopped) == 1
     await strategy.cleanup()
+
+
+# -harkbell.46: copy runs 7246-7251. Smart Turn called most of a caller's
+# finished sentences unfinished, and each waited out its two seconds.
+@pytest.mark.asyncio
+async def test_a_finished_sentence_the_analyzer_holds_ends_once_the_words_stop():
+    strategy, stopped = await _strategy(
+        hold_secs=0.4,
+        analyzer=_Analyzer(EndOfTurnState.INCOMPLETE),
+        steer_commits=False,
+        silence_backstop_secs=10,
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("Hi, this is Shahid. From StubHub support, I'm calling about an order."))
+    started = time.time()
+    await asyncio.sleep(0.5)
+    assert stopped == []
+    await asyncio.sleep(0.4)
+    assert len(stopped) == 1
+    assert 0.6 <= stopped[0] - started <= 0.9
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_words_that_stop_mid_thought_wait_longer():
+    strategy, stopped = await _strategy(
+        hold_secs=0.4,
+        analyzer=_Analyzer(EndOfTurnState.INCOMPLETE),
+        steer_commits=False,
+        silence_backstop_secs=10,
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("Uh, the customer"))
+    await asyncio.sleep(1.2)
+    assert stopped == []
+    await asyncio.sleep(1.0)
+    assert len(stopped) == 1
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_the_caller_speaking_again_cancels_the_words_timer():
+    strategy, stopped = await _strategy(
+        hold_secs=0.4,
+        analyzer=_Analyzer(EndOfTurnState.INCOMPLETE),
+        steer_commits=False,
+        silence_backstop_secs=10,
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("Hi, this is Shahid."))
+    await asyncio.sleep(0.3)
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await asyncio.sleep(0.8)
+    assert stopped == []
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_new_words_restart_the_words_timer():
+    strategy, stopped = await _strategy(
+        hold_secs=0.4,
+        analyzer=_Analyzer(EndOfTurnState.INCOMPLETE),
+        steer_commits=False,
+        silence_backstop_secs=10,
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("Hi, this is Shahid."))
+    await asyncio.sleep(0.5)
+    await strategy.process_frame(_interim("From StubHub"))
+    await asyncio.sleep(0.5)
+    assert stopped == []
+    await strategy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_steering_strategy_leaves_the_words_to_the_transcriber():
+    strategy, stopped = await _strategy(
+        hold_secs=0.4,
+        analyzer=_Analyzer(EndOfTurnState.INCOMPLETE),
+        silence_backstop_secs=10,
+    )
+    await strategy.process_frame(VADUserStartedSpeakingFrame())
+    await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+    await strategy.process_frame(_final("The tickets were never delivered."))
+    await asyncio.sleep(1.0)
+    assert stopped == []
+    await strategy.cleanup()

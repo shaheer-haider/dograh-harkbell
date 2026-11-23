@@ -526,7 +526,9 @@ class CustomToolManager:
                     # The answer is one sentence, said as it stands: the line
                     # says it and the model is not run to say it again.
                     logger.info(f"{function_name} answered with a sentence for the line; saying it")
-                    await self._engine.queue_text_message(line_says)
+                    # Into the context too: kept out of it, the model took the
+                    # sentence as unsaid and said it again (copy run 7247).
+                    await self._engine.queue_text_message(line_says, append_to_context=True)
                     await function_call_params.result_callback(
                         result, properties=FunctionCallResultProperties(run_llm=False)
                     )

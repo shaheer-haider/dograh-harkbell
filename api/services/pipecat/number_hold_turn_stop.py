@@ -59,6 +59,20 @@ which never asked whether the words were part of a number. Without steering:
   caller is still reading, and the silence is counted from their last word.
 - An interim with new words while a hold is pending is the caller still
   speaking: the hold starts again in full.
+
+Since ``-harkbell.46`` the transcriber's words can end a turn the analyzer
+judges unfinished (without steering). Copy runs 7246-7251 (2026-11-23): on a
+line where the VAD heard most of the caller, Smart Turn called a finished
+sentence unfinished on most turns -- "Hi, this is Shahid. From StubHub
+support, I am calling about an order." -- and the turn waited out the
+analyzer's two seconds: replies came 2.8-3.9 s after the caller's last word,
+where they had come in 1.2-1.4 s the day before on a line the VAD barely
+heard. Now, while the analyzer holds a turn open and the caller is silent,
+the words are timed the way the manually committed transcriber times them
+(``words_quiet_seconds``): 0.7 s after a sentence that has ended, 2.0 s after a
+dash, comma, filler, joining word or part-read number, or words with no full
+stop after them. Words still changing
+restart it; the caller speaking again cancels it.
 """
 
 import asyncio
@@ -255,6 +269,8 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         # When the last audio frame reached the strategy (monotonic).
         self._last_audio_at: float | None = None
         self._backstop_task: asyncio.Task | None = None
+        # Ends a turn the analyzer holds open once the words have stopped.
+        self._quiet_task: asyncio.Task | None = None
 
     @property
     def steers_commits(self) -> bool:
@@ -278,7 +294,12 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
                 self._hold_task = self.task_manager.create_task(
                     self._hold(self._hold_secs), f"{self}::number_hold"
                 )
+            changed = text != self._interim_text
             self._interim_text = text
+            result = await super().process_frame(frame)
+            if changed:
+                await self._arm_words_quiet()
+            return result
         return await super().process_frame(frame)
 
     def _words_the_vad_missed(self) -> bool:
@@ -316,12 +337,14 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         await self._cancel_task("_hold_task")
         await self._cancel_task("_final_wait_task")
         await self._cancel_task("_backstop_task")
+        await self._cancel_task("_quiet_task")
         await super()._discard_pending_end_of_turn()
 
     async def cleanup(self):
         await self._cancel_task("_hold_task")
         await self._cancel_task("_final_wait_task")
         await self._cancel_task("_backstop_task")
+        await self._cancel_task("_quiet_task")
         await super().cleanup()
 
     async def _cancel_task(self, name: str):
@@ -355,6 +378,7 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
         self._backstop_task = self.task_manager.create_task(
             self._silence_backstop(seconds), f"{self}::silence_backstop"
         )
+        await self._arm_words_quiet()
 
     async def _silence_backstop(self, seconds: float):
         try:
@@ -399,6 +423,45 @@ class NumberHoldTurnAnalyzerUserTurnStopStrategy(TurnAnalyzerUserTurnStopStrateg
             # Pipecat's fallback arms its own timer only before any VAD stop
             # this turn; after one, nothing else would judge these words.
             await self._maybe_trigger_user_turn_stopped()
+        await self._arm_words_quiet()
+
+    async def _arm_words_quiet(self):
+        """Time the words while the analyzer holds the turn open (since .46)."""
+        await self._cancel_task("_quiet_task")
+        if self._steer_commits or self._vad_user_speaking or self._turn_complete:
+            return
+        heard = self._heard()
+        if not heard:
+            return
+        from api.services.pipecat.elevenlabs_manual_stt import (
+            WORDS_UNFINISHED_QUIET_SECONDS,
+            words_quiet_seconds,
+        )
+
+        seconds = words_quiet_seconds(heard)
+        if heard.rstrip()[-1:] not in ".?!":
+            # A transcriber that punctuates writes no full stop after words
+            # that trail off ("Uh, the customer"): the analyzer may be right.
+            seconds = max(seconds, WORDS_UNFINISHED_QUIET_SECONDS)
+        self._quiet_task = self.task_manager.create_task(
+            self._words_quiet(seconds), f"{self}::words_quiet"
+        )
+
+    async def _words_quiet(self, seconds: float):
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._quiet_task = None
+        if self._vad_user_speaking or self._turn_complete:
+            return
+        logger.info(
+            f"{self}: the words stopped {seconds:.1f}s ago and the analyzer still "
+            f"holds the turn; ending it: {self._heard()[-60:]!r}"
+        )
+        self._turn_complete = True
+        await self._maybe_trigger_user_turn_stopped()
 
     def _heard(self) -> str:
         return f"{self._turn_text} {self._interim_text}".strip()

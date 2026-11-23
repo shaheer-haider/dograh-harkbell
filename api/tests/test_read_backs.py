@@ -89,3 +89,10 @@ def test_the_reply_filter_corrects_a_streamed_read_back():
         said += reply.feed(piece)
     said += reply.finish()
     assert said == "Seven, eight, six, six, zero, nine, nine — did I get that right?"
+
+
+def test_a_digit_dropped_from_a_number_split_by_a_misheard_word_is_put_back():
+    # Copy run 7246: "four" written as "For", and "one" dropped from the read-back.
+    guard = ReadBackGuard(["Order 644. For one 7208."])
+    said = guard.say("Let me read that back to you: six, four, four, seven, two, zero, eight. Is that right?")
+    assert said == "Let me read that back to you: six, four, four, one, seven, two, zero, eight. Is that right?"

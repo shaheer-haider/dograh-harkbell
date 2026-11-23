@@ -149,6 +149,12 @@ class ReadBackGuard:
 
     def __init__(self, latest: list[str], earlier: list[str] | None = None):
         self._heard = [digits for text in latest for digits, _, _ in _runs(text)]
+        if len(self._heard) > 1:
+            # Copy run 7246: "Order 644. For one 7208." is two runs either side
+            # of a misheard word, and the read-back dropped the "one" from
+            # the whole: 6447208 for 64417208. Each part on its own was too
+            # far from it to be the slip it was.
+            self._heard.append("".join(self._heard))
         said = [digits for text in [*(earlier or []), *latest] for digits, _, _ in _runs(text)]
         # Everything the caller said, in order, as one string: a number put
         # together from several turns is a part of it.
